@@ -318,6 +318,8 @@ type ReportSubmitter interface {
 func NewDispatcher(cfg *config.Config, db *store.DB, runner *sandbox.Runner, submitter ReportSubmitter, log *slog.Logger) *Dispatcher
 func (d *Dispatcher) Specs() []llm.ToolSpec                  // query_events/query_stats/execute_js/submit_report
 func (d *Dispatcher) Handle(ctx context.Context, call llm.ToolCall, win TaskWindow) (string, error)
+func TrimEvent(cfg *config.Config, e *store.Event) map[string]any // §9/§13 字段裁剪矩阵的唯一实现，query_events 输出与 reports 关键事件注入共用
+func TruncateRunes(s string, max int) string               // rune 截断（不补省略号），query_events message 与 reports 通知摘要共用
 ```
 
 query_events：强制 since/until（默认任务窗口）、跨度 ≤ cfg.Reports.MaxQuerySpanDays、
@@ -336,13 +338,13 @@ func WindowFor(kind string, now time.Time, loc *time.Location) (since, until tim
 type Generator struct{ /* cfg, db, llm, dispatcher, pub, log */ }
 // NewGenerator 内部自行创建 tools.Dispatcher（submitter 为 Generator 自身的草稿校验器）。
 // runner 为 nil 或 cfg.ScriptRunner.Enabled=false 时 execute_js 不可用。
-// runnerPath 传 cfg.ScriptRunner.RunnerPath（二进制缺失时降级为 nil 并 Warn）。
+// runner 由调用方传入；二进制缺失或禁用时由 cmd/analyst 先降级为 nil 并 Warn 再构造。
 func NewGenerator(cfg *config.Config, db *store.DB, client *llm.Client,
     runner *sandbox.Runner, pub *ntfy.Publisher, log *slog.Logger) (*Generator, error)
 func (g *Generator) Generate(ctx context.Context, kind string) error
 // 流程（§8.1）：算窗口→SQL统计→关键事件→LLM（带工具）→submit_report 校验
 // （key_stats 必须与 SQL 统计一致，否则拒绝并让模型修正一轮）→归档
-// state_dir/reports/YYYY/MM/daily-2006-01-02.json + reports 表 + ntfy 发布。
+// state_dir/reports/YYYY/MM/daily-20060102.json（紧凑日期，周报 weekly-YYYYMMDD.json）+ reports 表 + ntfy 发布。
 // 数据缺口（gaps/停滞）必须写入报告 data_quality，不得掩盖。
 // 失败：reports.status=failed + analysis_runs 记录错误，不发送报告通知。
 ```
