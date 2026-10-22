@@ -60,7 +60,7 @@ Cowrie JSONL 日志
 要求：Go 1.22+（模块 `github.com/modenc/e3-security-analyst`），bash。
 
 ```bash
-# 构建三个二进制（cmd/analyst 未落盘时 build.sh 会自动跳过）
+# 构建三个二进制
 go build -o bin/e3-collector    ./cmd/collector
 go build -o bin/e3-analyst      ./cmd/analyst
 go build -o bin/e3-script-runner ./cmd/script-runner
@@ -173,7 +173,7 @@ sqlite3 /tmp/e3smoke/events.db "SELECT file_key, offset, file_size FROM collecto
 | `ntfy.topic` | `change-me` | **必改**：默认主题（占位符）。字母/数字/下划线/连字符，长度 1-64 |
 | `ntfy.alert_topic` | `""` | 实时告警主题，留空退回 `topic`；建议与报告主题分开 |
 | `ntfy.report_topic` | `""` | 报告主题，留空退回 `topic` |
-| `ntfy.token_env` | `NTFY_TOKEN` | **安全注意**：Token 所在环境变量名，值经 0600 的 ntfy.env 注入；留空则匿名发布（可能被服务端拒绝） |
+| `ntfy.token_env` | `NTFY_TOKEN` | **安全注意**：Token 所在环境变量名（不可留空），值经 0600 的 ntfy.env 注入；所指环境变量未注入（值为空）时以匿名模式发布（仅告警，可能被服务端拒绝） |
 | `ntfy.timeout_seconds` | `10` | 单次发布超时，范围 [1, 120] |
 | `ntfy.max_retries` | `5` | 单条通知最大尝试次数（含首次），范围 [0, 20]；耗尽后持久化待补发 |
 | `ntfy.max_message_bytes` | `4000` | 消息正文字节上限，范围 [500, 4096] |
@@ -251,7 +251,7 @@ sqlite3 /tmp/e3smoke/events.db "SELECT file_key, offset, file_size FROM collecto
 | e3-analyst report | `e3-daily-report.service` / `e3-weekly-report.service` | llm.env + ntfy.env | 同上 |
 | e3-script-runner | 无独立 unit（analyst 子进程） | **无** | **无任何凭据**（空环境启动，不继承任何 env 文件） |
 
-三个 env 文件均 0600 e3sec:e3sec，由 systemd（PID 1）在降权前读取；`EnvironmentFile` 带 `-` 前缀，文件缺失仍可启动（collector 进入匿名采集模式，保证采集先行跑通）。
+两个 env 文件（ntfy.env、llm.env）均 0600 e3sec:e3sec，由 systemd（PID 1）在降权前读取；`EnvironmentFile` 带 `-` 前缀，文件缺失仍可启动（collector 进入匿名采集模式，保证采集先行跑通）。
 
 ### Cowrie 日志路径与只读授权
 
@@ -314,7 +314,7 @@ Cowrie 日志中的命令、用户名、密码、路径、文件名、消息文�
 - **事实分层**：每条陈述必须归入四类之一——直接观察事实（引用 `event:<ID>` / `session:<ID>`）、程序统计（只能来自 STATS_JSON 或 `query_stats`）、模型推断（附依据与置信度）、待人工确认假设（标注证据缺口）。
 - **措辞约定**：Cowrie 是蜜罐，`cowrie.login.success` 一律表述为"蜜罐内模拟登录成功"，绝不表述为真实主机失陷/凭据泄露（规则告警文案同样受此约束）；空窗口如实报告为无活动；不确定结论写明置信度。
 - **数据缺口如实呈现**：采集缺口（`collector_gaps`）、解析错误（`parse_errors`）、采集停滞、查询截断、prev 缺失必须写入报告的 data_limitations，禁止生成看似完整实则掩盖缺口的报告。
-- **可追溯性**：报告归档到 `state_dir/reports/YYYY/MM/daily-2006-01-02.json`（周报同目录），并落 `reports` 表（`UNIQUE(report_type, window_start)`，含 `content_sha256`、model、attempts）；分析过程记录于 `analysis_runs`（轮数、token、工具调用次数、错误），模型执行的每段 JS 记录于 `script_runs`（`run_id` 关联 `analysis_runs.id`、`code_sha256`）。失败时 `reports.status=failed` 且不发报告通知。
+- **可追溯性**：报告归档到 `state_dir/reports/YYYY/MM/daily-YYYYMMDD.json`（如 `daily-20260102.json`，周报同目录），并落 `reports` 表（`UNIQUE(report_type, window_start)`，含 `content_sha256`、model、attempts）；分析过程记录于 `analysis_runs`（轮数、token、工具调用次数、错误），模型执行的每段 JS 记录于 `script_runs`（`run_id` 关联 `analysis_runs.id`、`code_sha256`）。失败时 `reports.status=failed` 且不发报告通知。
 
 ## 8. 测试矩阵
 
@@ -331,6 +331,9 @@ Cowrie 日志中的命令、用户名、密码、路径、文件名、消息文�
 | 规则告警 | `internal/rules/engine_test.go` | login.success 立即发送与会话去重；文件上传告警与去重；login.failed 聚合触发与递进；每会话首条命令（含重启后不重复）；connect 洪水汇总；全局限流与 digest 汇总 |
 | 存储与调度 | `internal/store/*_test.go`、`internal/scheduler/window_test.go` | Open/Migrate 幂等与顺序；插入去重（raw SHA-256）；会话跨批次聚合；游标/健康/缺口/解析错误往返；通知生命周期；报告 upsert/失败列表；analysis_runs、script_runs 往返；daily/weekly 窗口跨月跨年/周日/UTC/时区转换；PrevWindow |
 | 工具调度 | `internal/tools/*_test.go` | query_events 默认窗口/字段剪裁/跨度校验/limit 钳制/字节预算；query_stats 透传与 TopN；execute_js 禁用态/成功审计/脚本错误/输入超限/超时钳制；submit_report 接受/类型不匹配/校验/拒绝/禁止键/未知字段容忍；Specs 合法与未知工具 |
+| 安全验收（阶段 G） | `internal/security/s1_injection_test.go`、`s2_credentials_test.go`、`s3_resources_test.go` | 提示词注入端到端：错型提交/编造 key_stats 被拒、注入内容仅是数据、submit_report 带 url/topic/token 键报错；凭据隔离：runner 子进程空环境（Key/Token 不可见）、密钥不进 LLM 请求体/日志/Redacted；资源耗尽组合复验：execute_js 超时/超大输入输出、query_events 跨度超限与 limit 钳制 |
+| 端到端集成 | `tests/e1_fullpipeline_test.go`、`e2_restart_recovery_test.go`、`e3_nollm_test.go`、`e4_cli_test.go` | 全链路（采集入库含坏行、字段保真、确定性统计、mock LLM 报告归档、实时告警先于报告、key_stats 与 SQL 一致）；重启幂等与通知恢复（pending 不丢、不重复）；无 LLM 凭据时采集与实时告警照常；e3-analyst verify 冒烟与 deploy unit → report 链路可达 |
+| CLI 与嵌入资产 | `cmd/collector/main_test.go`、`cmd/analyst/main_test.go`、`prompts/embed_test.go` | 示例配置逐字段可加载且通过校验（与 config schema 防漂移）；默认配置路径环境变量覆盖；verify 缺失凭据场景；内嵌提示词模板恰好 3 个 |
 
 运行：
 
@@ -372,7 +375,7 @@ sudo -u e3sec sqlite3 /var/lib/e3-security-analyst/events.db \
    SELECT file_path, file_offset, error, recorded_at FROM parse_errors ORDER BY id DESC LIMIT 10;
    ```
 7. **手工触发报告**：`sudo systemctl start e3-daily-report.service`（或 `e3-weekly-report.service`），等价于 `e3-analyst report --type daily --config /etc/e3-security-analyst/config.yaml`。
-8. **verify 自检**：`e3-analyst verify --config /etc/e3-security-analyst/config.yaml`（契约子命令：配置/环境自检）。自检清单：配置可加载且字段校验通过；`DEEPSEEK_API_KEY` / `NTFY_TOKEN` 所指环境变量是否已注入；`cowrie.log_path` 是否可读；数据库能否打开并完成迁移；`script_runner.runner_path` 是否存在。部署后先跑一遍可快速定位上述 1-4 类问题。
+8. **verify 自检**：`e3-analyst verify --config /etc/e3-security-analyst/config.yaml`（契约子命令：配置/环境自检）。自检清单：配置可加载且字段校验通过；时区可加载；`DEEPSEEK_API_KEY` / `NTFY_TOKEN` 所指环境变量是否已注入（值不显示）；`cowrie.log_path` 是否存在且可读；`database.path` 父目录与 reports 目录是否可写（不存在则按 0700 创建）；`script_runner.runner_path` 是否存在（禁用时不检查）；`llm.base_url` / `ntfy.base_url` 是否为 https。部署后先跑一遍可快速定位上述 1-4 类问题。
 
 ## 10. 项目结构
 
@@ -396,9 +399,10 @@ e3-security-analyst/
 │   ├── tools/                   # 模型工具调度（query_events/query_stats/execute_js/submit_report）
 │   ├── reports/                 # 报告生成（按 docs/CONTRACTS.md 实现）
 │   ├── ntfy/                    # ntfy 客户端 + 持久化发布队列
-│   └── security/                # 预留：安全验收阶段填充（SPEC 阶段 G）
+│   └── security/                # 安全验收测试（S1 提示词注入 / S2 凭据隔离 / S3 资源耗尽，SPEC 阶段 G）
 ├── prompts/                     # analyst.md（系统提示词）、daily-report.md、weekly-report.md（嵌入模板）
-├── migrations/                  # 0001_init.sql（schema_migrations 版本化迁移）
+├── migrations/                  # 0001_init.sql + embed.go（schema_migrations 版本化迁移）
+├── tests/                       # E1–E4 跨组件端到端集成测试（SPEC §16 验收映射）
 ├── deploy/                      # install.sh、6 个 systemd unit、env.example、README.md
 ├── configs/config.example.yaml
 ├── scripts/build.sh             # 构建 linux/amd64 到 bin/linux-amd64/（--tests 先跑测试）

@@ -18,7 +18,8 @@ app:
   # 展示时区（日报/周报/告警文案的时间均按此时区输出）。
   # 取值：IANA 时区名，如 Asia/Shanghai、UTC。
   timezone: Asia/Shanghai
-  # 状态目录：SQLite 数据库、报告归档等落在这里。必须存在且 0700 e3sec:e3sec。
+  # 状态目录：SQLite 数据库、报告归档等落在这里（不存在时自动按 0700 创建；
+  # 生产要求属主 e3sec:e3sec，由 deploy/install.sh 预建）。
   state_dir: /var/lib/e3-security-analyst
   # 日志级别：debug | info | warn | error（JSON 结构化日志输出到 stdout/journald）。
   log_level: info

@@ -62,7 +62,7 @@ systemctl list-timers 'e3-*'                # 两个 timer 的下次触发时间
 
 要点：
 
-- 三个 env 文件均 `0600 e3sec:e3sec`，由 systemd（PID 1）在降权前读取，
+- 两个 env 文件（ntfy.env、llm.env）均 `0600 e3sec:e3sec`，由 systemd（PID 1）在降权前读取，
   进程自身无法改写。
 - **collector 只加载 `ntfy.env`**——即使它被攻破也没有 LLM 凭据。
 - 所有 unit 均以专用低权限用户 `e3sec` 运行，`CapabilityBoundingSet=`（空），
