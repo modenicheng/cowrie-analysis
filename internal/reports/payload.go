@@ -222,7 +222,9 @@ func (g *Generator) reportBody(draft *Draft, gaps []store.Gap, archivePath strin
 			fmt.Sprintf("\n图表: %s", img.URL)
 	}
 	var b strings.Builder
-	b.WriteString(tools.TruncateRunes(draft.Summary, notifySummaryRunes))
+	// summary 与 finding 标题回显攻击者可控内容，Markdown 渲染前转义
+	// 链接构成字符（escape.go）；severity 已经 SubmitDraft 枚举校验。
+	b.WriteString(tools.TruncateRunes(escapeCommonMark(draft.Summary), notifySummaryRunes))
 	fmt.Fprintf(&b, "\n**连接 %d|独立IP %d|登录成功 %d|失败 %d**",
 		int(*draft.KeyStats.Connections), int(*draft.KeyStats.UniqueSrcIPs),
 		int(*draft.KeyStats.LoginSuccess), int(*draft.KeyStats.LoginFailed))
@@ -230,7 +232,7 @@ func (g *Generator) reportBody(draft *Draft, gaps []store.Gap, archivePath strin
 		if i >= notifyFindingMax {
 			break
 		}
-		fmt.Fprintf(&b, "\n- [%s] %s", f.Severity, f.Title)
+		fmt.Fprintf(&b, "\n- [%s] %s", f.Severity, escapeCommonMark(f.Title))
 	}
 	fmt.Fprintf(&b, "\n![chart](%s)", img.URL)
 	b.WriteString(g.gapLine(gaps))
