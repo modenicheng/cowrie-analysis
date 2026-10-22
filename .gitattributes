@@ -1,0 +1,3 @@
+# 统一行尾为 LF（仓库现状即全 LF；含需在 Linux 直接执行的 deploy/*.sh、scripts/*.sh，
+# 防止 Windows 贡献者因 core.autocrlf=true 提交 CRLF 破坏脚本执行）。
+* text=auto eol=lf

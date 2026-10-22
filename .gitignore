@@ -1,9 +1,10 @@
 # 构建产物
 /bin/
 *.exe
-e3-collector
-e3-analyst
-e3-script-runner
+# 锚定仓库根：根目录裸 go build 的产物；避免误伤子目录同名文件（如 docs/e3-analyst）
+/e3-collector
+/e3-analyst
+/e3-script-runner
 
 # 运行时数据（不入库：数据库/归档报告/本地状态）
 *.db
