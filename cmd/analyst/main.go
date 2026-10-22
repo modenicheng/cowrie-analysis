@@ -95,8 +95,23 @@ func usage(w io.Writer) {
 `, configEnvVar)
 }
 
-// loadConfig 解析子命令的 --config 并加载配置；失败时以退出码 2 结束
-// （与 cmd/collector 一致的兜底 stderr 日志风格）。
+// loadConfigFile 加载配置文件；失败时以兜底 stderr 日志记录后返回退出码
+// 2（与 cmd/collector 一致的风格）。
+func loadConfigFile(path string) (*config.Config, int) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		boot, bootErr := logging.New("info", os.Stderr)
+		if bootErr != nil {
+			fmt.Fprintf(os.Stderr, "e3-analyst: 加载配置 %s 失败: %v\n", path, err)
+			return nil, 2
+		}
+		boot.Error("加载配置失败", "path", path, "error", err)
+		return nil, 2
+	}
+	return cfg, 0
+}
+
+// loadConfig 解析子命令的 --config 并加载配置；失败时以退出码 2 结束。
 func loadConfig(args []string, name string) (*config.Config, *string, int) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -108,15 +123,9 @@ func loadConfig(args []string, name string) (*config.Config, *string, int) {
 		fmt.Fprintf(os.Stderr, "e3-analyst %s: 未知位置参数 %v\n", name, fs.Args())
 		return nil, nil, 2
 	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		boot, bootErr := logging.New("info", os.Stderr)
-		if bootErr != nil {
-			fmt.Fprintf(os.Stderr, "e3-analyst: 加载配置 %s 失败: %v\n", *configPath, err)
-			return nil, nil, 2
-		}
-		boot.Error("加载配置失败", "path", *configPath, "error", err)
-		return nil, nil, 2
+	cfg, code := loadConfigFile(*configPath)
+	if code != 0 {
+		return nil, nil, code
 	}
 	return cfg, configPath, 0
 }
@@ -235,15 +244,9 @@ func cmdReport(args []string) int {
 		return 2
 	}
 
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		boot, bootErr := logging.New("info", os.Stderr)
-		if bootErr != nil {
-			fmt.Fprintf(os.Stderr, "e3-analyst: 加载配置 %s 失败: %v\n", *configPath, err)
-			return 2
-		}
-		boot.Error("加载配置失败", "path", *configPath, "error", err)
-		return 2
+	cfg, code := loadConfigFile(*configPath)
+	if code != 0 {
+		return code
 	}
 	log, err := logging.New(cfg.App.LogLevel, os.Stdout)
 	if err != nil {

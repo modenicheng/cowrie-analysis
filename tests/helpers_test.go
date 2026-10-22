@@ -181,10 +181,9 @@ type ntfyReq struct {
 }
 
 type ntfyMock struct {
-	mu     sync.Mutex
-	got    []ntfyReq
-	status int
-	srv    *httptest.Server
+	mu  sync.Mutex
+	got []ntfyReq
+	srv *httptest.Server
 }
 
 func newNtfyMock(t *testing.T) *ntfyMock {
@@ -201,12 +200,7 @@ func newNtfyMock(t *testing.T) *ntfyMock {
 			Tags:     r.Header.Get("Tags"),
 			Auth:     r.Header.Get("Authorization"),
 		})
-		status := m.status
 		m.mu.Unlock()
-		if status != 0 {
-			w.WriteHeader(status)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"mock-msg-1"}`))
 	}))
@@ -218,12 +212,6 @@ func (m *ntfyMock) requests() []ntfyReq {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]ntfyReq(nil), m.got...)
-}
-
-func (m *ntfyMock) setStatus(code int) {
-	m.mu.Lock()
-	m.status = code
-	m.mu.Unlock()
 }
 
 // byTitle 返回标题完全匹配的请求数。
