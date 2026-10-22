@@ -58,6 +58,7 @@ type Collector struct {
 
 	bootstrapped bool
 	gapOpen      bool      // 当前缺失期间是否已记录 gap（同一缺失只记一次）
+	afterMissing bool      // 因路径持续缺失关闭句柄后待重现：下次路径出现时游标作废、从 0 重读
 	lastGoodAt   time.Time // 最近一次路径存在或有数据的时间，作为 gap 起点
 
 	lastEventAt time.Time
@@ -175,7 +176,15 @@ func (c *Collector) PollOnce(ctx context.Context) (bool, error) {
 		c.gapOpen = false // 文件恢复，结束缺失标记
 		switch {
 		case c.cur == nil:
-			if err := c.resumeFromCursor(ctx, probeTF); err != nil {
+			if c.afterMissing {
+				// 路径持续缺失关闭句柄后重现：即使 FileKey 相同也不是同一个
+				// 文件对象——Linux 删除后原地重建常复用 inode，若沿用旧游标，
+				// offset 相等时新内容永远读不到、offset 更小时新文件前段被
+				// 静默跳过。一律从 0 重读，靠 raw sha256 去重兜底重复。
+				c.afterMissing = false
+				c.log.Warn("日志路径缺失后重现，旧游标作废，从头重读",
+					"path", probeTF.path, "key", probeTF.key)
+			} else if err := c.resumeFromCursor(ctx, probeTF); err != nil {
 				_ = probeTF.file.Close()
 				c.failHealth(ctx, err)
 				return progress, err
@@ -249,6 +258,7 @@ func (c *Collector) PollOnce(ctx context.Context) (bool, error) {
 		_ = c.cur.file.Close()
 		c.log.Warn("日志路径持续缺失，关闭旧句柄", "path", c.cur.path, "key", c.cur.key)
 		c.cur = nil
+		c.afterMissing = true
 	}
 
 	if progress {
