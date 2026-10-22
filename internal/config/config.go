@@ -387,9 +387,21 @@ func (c *Config) ReportTopic() string {
 	return c.Ntfy.Topic
 }
 
-// Redacted 返回用于日志的脱敏摘要：只展示密钥的环境变量名，绝不展示解析值。
+// redactURL 剥离 URL 中的 userinfo（https://user:pass@host → https://host），
+// 防止嵌入 base_url 的凭据随 Redacted 摘要进入 journald；解析失败时原样返回。
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		return raw
+	}
+	u.User = nil
+	return u.String()
+}
+
+// Redacted 返回用于日志的脱敏摘要：只展示密钥的环境变量名，绝不展示解析值；
+// llm/ntfy base_url 打印前剥离 URL userinfo。
 func (c *Config) Redacted() string {
 	return fmt.Sprintf("config{timezone=%s state_dir=%s db=%s llm=%s model=%s key_env=%s ntfy=%s token_env=%s topic=%s}",
-		c.App.Timezone, c.App.StateDir, c.Database.Path, c.LLM.BaseURL, c.LLM.Model,
-		c.LLM.APIKeyEnv, c.Ntfy.BaseURL, c.Ntfy.TokenEnv, c.Ntfy.Topic)
+		c.App.Timezone, c.App.StateDir, c.Database.Path, redactURL(c.LLM.BaseURL), c.LLM.Model,
+		c.LLM.APIKeyEnv, redactURL(c.Ntfy.BaseURL), c.Ntfy.TokenEnv, c.Ntfy.Topic)
 }

@@ -135,7 +135,7 @@
   - **detail**：事实描述与（如为推断）推断理由，标明事实分层类别；
   - **severity**：只能取 "critical"｜"high"｜"medium"｜"low"｜"info" 之一；
   - **evidence**：证据引用数组，每项为 "event:<事件ID>"、"session:<会话ID>" 或 "stats:<指标名>"（如 "stats:connections"、"stats:top_src_ips"）。重要结论必须携带至少一条证据引用。
-- **key_stats**：四个整数，必须与任务 STATS_JSON（或最后一次 query_stats 返回）中的 connections、unique_src_ips、login_success、login_failed 完全一致；不一致会被拒绝并要求修正。
+- **key_stats**：四个整数，必须与本任务窗口的 STATS_JSON（任务消息中注入的统计）中的 connections、unique_src_ips、login_success、login_failed 完全一致；校验只认任务窗口的 SQL 统计，不要照抄其他窗口（例如前一周）的 query_stats 返回值，否则会被拒绝并要求修正。需要上一周期的完整统计做对比时，可调用 query_stats 指定前一周的 since/until 窗口查询（跨度不超过 31 天），其结果仅用于对比表述，不得替代本任务窗口的 key_stats。
 - **confidence**：0 到 1 的小数（例如 0.7），表示你对本报告整体分析的置信度；数字越高越确信。置信度依据与主要证据缺口可另在 data_limitations 或 summary 中用文字补充说明。
 - **data_limitations**：一段不超过 500 字的文字，集中描述数据缺口、统计限制与证据不足之处（采集缺口 gaps、解析错误、采集停滞、查询截断、prev 缺失、TopN 截断等）；确无缺口时简要写明「未发现明显数据缺口」。
 

@@ -178,3 +178,36 @@ llm:
 		t.Errorf("非法 thinking 应在 Load 时报错且含字段名, got %v", err)
 	}
 }
+
+// Redacted 打印 llm/ntfy base_url 前剥离 URL userinfo，防凭据进 journald。
+func TestRedactedStripsUserinfo(t *testing.T) {
+	c := Default()
+	c.LLM.BaseURL = "https://user:secret@api.deepseek.com"
+	c.Ntfy.BaseURL = "http://alice:hunter2@localhost"
+	out := c.Redacted()
+
+	for _, sub := range []string{"https://api.deepseek.com", "http://localhost"} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("Redacted 应包含剥 userinfo 后的 URL %q: %s", sub, out)
+		}
+	}
+	for _, leak := range []string{"user:secret", "alice:hunter2", ":secret@", "hunter2"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("Redacted 泄露 URL userinfo %q: %s", leak, out)
+		}
+	}
+}
+
+// redactURL：无 userinfo / 非法输入原样返回。
+func TestRedactURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://api.deepseek.com", "https://api.deepseek.com"},
+		{"https://user:pass@host.example/path?q=1", "https://host.example/path?q=1"},
+		{"http://token@localhost", "http://localhost"},
+	}
+	for _, tc := range cases {
+		if got := redactURL(tc.in); got != tc.want {
+			t.Errorf("redactURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
