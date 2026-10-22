@@ -1,0 +1,57 @@
+# e3-collector.service — Cowrie JSONL 日志采集器（常驻）
+#
+# 权限与凭据（SPEC §14）：
+#   - 专用低权限系统用户 e3sec 运行，非 root，无任何 capability。
+#   - 唯一凭据 NTFY_TOKEN，来自 /etc/e3-security-analyst/ntfy.env
+#     （0600、owner e3sec:e3sec；由 systemd(PID 1) 在降权前读取）。
+#   - '/var/log/cowrie 只读；仅 /var/lib/e3-security-analyst 可写。
+#   - EnvironmentFile 前缀 '-' 表示文件缺失时仍可启动（匿名采集模式，
+#     仅通知发送受影响，保证采集先行跑通）。
+
+[Unit]
+Description=E3 Security Analyst - Cowrie log collector
+Documentation=file:/etc/e3-security-analyst/config.yaml
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=e3sec
+Group=e3sec
+EnvironmentFile=-/etc/e3-security-analyst/ntfy.env
+ExecStart=/usr/local/bin/e3-collector --config /etc/e3-security-analyst/config.yaml
+Restart=always
+RestartSec=5s
+
+# —— systemd 加固（SPEC §14）——
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+# 文件系统访问：状态目录可写，Cowrie 日志只读。
+ReadWritePaths=/var/lib/e3-security-analyst
+ReadOnlyPaths=/var/log/cowrie
+
+# 结构化 JSON 日志走 journald。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=e3-collector
+
+[Install]
+WantedBy=multi-user.target

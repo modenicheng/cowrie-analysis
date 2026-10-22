@@ -1,0 +1,53 @@
+# e3-daily-report.service — 日报生成（oneshot，由 e3-daily-report.timer 触发）
+#
+# 分析窗口：前一自然日 [前一天 00:00, 当天 00:00) Asia/Shanghai（SPEC §11）。
+#
+# 权限与凭据（SPEC §14）：
+#   - 凭据 DEEPSEEK_API_KEY（llm.env）+ NTFY_TOKEN（ntfy.env），两个文件均须
+#     0600、owner e3sec:e3sec，由 systemd(PID 1) 在降权前读取。
+#   - 这些凭据绝不能给 script-runner 进程：runner 由 analyst 以空环境子进程
+#     启动，凭据不继承（SPEC §9/§18）。
+
+[Unit]
+Description=E3 Security Analyst - daily report (oneshot, triggered by timer)
+Documentation=file:/etc/e3-security-analyst/config.yaml
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=e3sec
+Group=e3sec
+EnvironmentFile=-/etc/e3-security-analyst/llm.env
+EnvironmentFile=-/etc/e3-security-analyst/ntfy.env
+ExecStart=/usr/local/bin/e3-analyst report --type daily --config /etc/e3-security-analyst/config.yaml
+# LLM 多轮工具调用可能较慢，oneshot 整体上限 30 分钟。
+TimeoutStartSec=30min
+
+# —— systemd 加固（SPEC §14）——
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+# 报告归档与通知状态写入状态目录。
+ReadWritePaths=/var/lib/e3-security-analyst
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=e3-daily-report

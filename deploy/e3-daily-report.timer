@@ -1,0 +1,14 @@
+# e3-daily-report.timer — 每天 08:00（Asia/Shanghai）触发日报（SPEC §11/§14）
+# Persistent=true：错过的触发（关机期间）开机后补跑一次。
+
+[Unit]
+Description=E3 Security Analyst - daily report timer (08:00 Asia/Shanghai)
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=0
+Unit=e3-daily-report.service
+
+[Install]
+WantedBy=timers.target

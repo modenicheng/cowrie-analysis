@@ -1,0 +1,132 @@
+# =============================================================================
+# e3-security-analyst 配置示例（Ubuntu 24.04 部署）
+#
+# 使用方法：复制到 /etc/e3-security-analyst/config.yaml 并按实际环境修改。
+# 本文件与 internal/config.Config 逐字段一一对应；未知字段会导致加载失败，
+# 越界值会在校验阶段被拒绝（错误信息含字段名与允许范围）。
+#
+# 安全约定（SPEC §13 / §18）：
+#   - 本文件绝不包含真实 Token / API Key；凭据一律通过 *_env 指定的环境变量
+#     注入（llm.api_key_env → DEEPSEEK_API_KEY，ntfy.token_env → NTFY_TOKEN），
+#     由 systemd EnvironmentFile 加载权限 0600、owner e3sec 的 env 文件。
+#   - 日志中只出现环境变量名，绝不出现其值。
+#   - 权限要求：app.state_dir 必须 0700、owner e3sec:e3sec；
+#     /etc/e3-security-analyst/*.env 必须 0600、owner e3sec:e3sec。
+# =============================================================================
+
+app:
+  # 展示时区（日报/周报/告警文案的时间均按此时区输出）。
+  # 取值：IANA 时区名，如 Asia/Shanghai、UTC。
+  timezone: Asia/Shanghai
+  # 状态目录：SQLite 数据库、报告归档等落在这里。必须存在且 0700 e3sec:e3sec。
+  state_dir: /var/lib/e3-security-analyst
+  # 日志级别：debug | info | warn | error（JSON 结构化日志输出到 stdout/journald）。
+  log_level: info
+
+cowrie:
+  # Cowrie JSONL 日志路径。注意：不同 Cowrie 容器/安装方式的挂载路径不同，
+  # 上线前必须按实际容器挂载目录确认（例如 docker 部署常见宿主机路径为
+  # /var/lib/docker/volumes/.../cowrie.json，本机安装常见 /var/log/cowrie/cowrie.json）。
+  # 运行用户 e3sec 需要对该文件及其目录有读权限（只读即可）。
+  log_path: /var/log/cowrie/cowrie.json
+  # 是否持续尾随读取（常驻采集应为 true）。
+  follow: true
+  # 是否无损保留原始 JSON 行（events.raw，取证与去重依据，建议 true）。
+  preserve_raw: true
+  # 轮询间隔（毫秒）。范围 [50, 60000]；越小延迟越低、IO 越频繁。
+  follow_interval_ms: 500
+  # 轮转后的旧文件在无新数据情况下继续抽干多久后关闭（毫秒）。范围 [0, 60000]。
+  rotation_grace_ms: 2000
+
+database:
+  # SQLite 数据库文件路径（自动创建父目录 0700、库文件 0600）。
+  path: /var/lib/e3-security-analyst/events.db
+  # 是否开启 WAL 模式（建议 true，读写并发更平滑）。
+  wal: true
+  # busy_timeout（毫秒）。范围 [100, 60000]。
+  busy_timeout_ms: 5000
+
+llm:
+  # DeepSeek（OpenAI 兼容）API Base URL。必须 https（仅回环地址允许 http）。
+  base_url: https://api.deepseek.com
+  # 模型名。
+  model: deepseek-chat
+  # API Key 所在环境变量名（值经 /etc/e3-security-analyst/llm.env 注入，
+  # 0600 e3sec:e3sec；本文件不写 Key 本体）。
+  api_key_env: DEEPSEEK_API_KEY
+  # 单次 HTTP 请求总超时（秒）。范围 [5, 600]。
+  timeout_seconds: 90
+  # 单任务最大工具调用轮数。范围 [1, 16]；达到上限返回部分分析或明确失败。
+  max_tool_rounds: 6
+  # 单次响应最大输出 Token。范围 [256, 32768]。
+  max_output_tokens: 4096
+  # 任务级累计 Token 预算。范围 [10000, 10000000]。
+  max_total_tokens: 200000
+  # 是否启用工具调用；false 时降级为一次性结构化分析（无 execute_js 等）。
+  enable_tools: true
+  # 是否把登录尝试中的 password 字段提交给模型（SPEC §9：默认 false，
+  # 源 IP/用户名/命令/路径等始终保留原值，仅凭据字段受此开关控制）。
+  include_passwords: false
+
+script_runner:
+  # 是否启用受限 JavaScript 执行（Goja，独立子进程、空环境、限额）。
+  enabled: true
+  # script-runner 二进制的绝对路径（由 scripts/build.sh 构建并安装）。
+  runner_path: /usr/local/bin/e3-script-runner
+  # 单个脚本执行超时（毫秒）。范围 [100, 30000]。
+  timeout_ms: 2000
+  # 任务输入字节上限。范围 (0, 8MiB]，示例 1MiB。
+  max_input_bytes: 1048576
+  # 结果输出字节上限。范围 (0, 2MiB]，示例 256KiB。
+  max_output_bytes: 262144
+  # 并发执行上限。范围 [1, 8]。
+  max_concurrency: 1
+
+ntfy:
+  # ntfy 服务地址。必须 https（仅回环地址允许 http）。
+  base_url: https://notify.modenc.top
+  # 默认主题（占位符，部署时必须改成真实主题名）。字母/数字/下划线/连字符，长度 1-64。
+  topic: change-me
+  # 实时告警主题；留空时退回 topic。建议与报告主题分开，便于客户端区分。
+  alert_topic: ""
+  # 报告主题；留空时退回 topic。
+  report_topic: ""
+  # Token 所在环境变量名（值经 /etc/e3-security-analyst/ntfy.env 注入，
+  # 0600 e3sec:e3sec；collector 只需要这一个凭据）。
+  token_env: NTFY_TOKEN
+  # 单次 HTTP 发布超时（秒）。范围 [1, 120]。
+  timeout_seconds: 10
+  # 单条通知的最大尝试次数（含首次）。范围 [0, 20]；失败后仍持久化待补发。
+  max_retries: 5
+  # 单条消息正文字节上限。范围 [500, 4096]（ntfy 服务端限制 4096）。
+  max_message_bytes: 4000
+
+alerts:
+  # 是否启用确定性实时告警（不依赖 LLM；false 时 collector 只采集入库）。
+  enabled: true
+  # 全局每分钟最多发送条数，超出部分合并进摘要。范围 [1, 1000]。
+  max_per_minute: 10
+  # 登录失败聚合窗口（秒）。范围 [10, 86400]。
+  login_failed_window_seconds: 300
+  # 窗口内失败次数达到该值触发汇总告警。范围 [1, 100000]。
+  login_failed_threshold: 10
+  # 触发后每再累计该次数递进补发一条。范围 [1, 100000]。
+  login_failed_repeat_every: 50
+  # 限流合并摘要的发送周期（秒）。范围 [30, 86400]。
+  digest_interval_seconds: 900
+
+reports:
+  # 是否生成日报（由 e3-daily-report.timer 每天 08:00 Asia/Shanghai 触发）。
+  daily_enabled: true
+  # 是否生成周报（由 e3-weekly-report.timer 每周一 08:15 Asia/Shanghai 触发）。
+  weekly_enabled: true
+  # 报告数据是否包含源 IP（分析需要，保留原值不脱敏）。
+  include_source_ips: true
+  # 报告数据是否包含路径/文件名。
+  include_paths: true
+  # 报告数据是否包含攻击命令原文。
+  include_commands: true
+  # 报告归档目录；留空时默认 app.state_dir/reports（0700 e3sec:e3sec）。
+  dir: ""
+  # 模型单次查询允许的最大时间跨度（天）。范围 [1, 366]。
+  max_query_span_days: 31

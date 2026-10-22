@@ -1,0 +1,14 @@
+# e3-weekly-report.timer — 每周一 08:15（Asia/Shanghai）触发周报（SPEC §11/§14）
+# Persistent=true：错过的触发（关机期间）开机后补跑一次。
+
+[Unit]
+Description=E3 Security Analyst - weekly report timer (Mon 08:15 Asia/Shanghai)
+
+[Timer]
+OnCalendar=Mon *-*-* 08:15:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=0
+Unit=e3-weekly-report.service
+
+[Install]
+WantedBy=timers.target

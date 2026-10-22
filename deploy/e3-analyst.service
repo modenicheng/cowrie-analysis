@@ -1,0 +1,60 @@
+# e3-analyst.service — 分析守护进程（常驻）
+#
+# 职责：周期 FlushPending（每 30s 重试失败通知）+ 周期重试失败报告
+#（analyst daemon 子命令）。
+#
+# 权限与凭据（SPEC §14）：
+#   - 凭据 DEEPSEEK_API_KEY（llm.env）+ NTFY_TOKEN（ntfy.env），两个文件均须
+#     0600、owner e3sec:e3sec，由 systemd(PID 1) 在降权前读取。
+#   - 这些凭据绝不能进入 script-runner 子进程：analyst 以"空环境"启动
+#     runner（代码层强制，Env 置空），凭据不继承（SPEC §9/§18）。
+#   - '/var/lib/e3-security-analyst 可写（报告归档/通知状态）。
+
+[Unit]
+Description=E3 Security Analyst - analysis daemon
+Documentation=file:/etc/e3-security-analyst/config.yaml
+After=network-online.target
+Wants=network-online.target
+# 数据库由 collector 写入；顺序上不强制依赖（analyst 容忍只读等待）。
+
+[Service]
+Type=simple
+User=e3sec
+Group=e3sec
+EnvironmentFile=-/etc/e3-security-analyst/llm.env
+EnvironmentFile=-/etc/e3-security-analyst/ntfy.env
+ExecStart=/usr/local/bin/e3-analyst daemon --config /etc/e3-security-analyst/config.yaml
+Restart=always
+RestartSec=5s
+
+# —— systemd 加固（SPEC §14）——
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+# 状态目录可写（报告、通知补发状态）；script-runner 子进程继承同一沙箱，
+# 额外受"空环境 + 超时/输出限额"约束（internal/sandbox.Runner）。
+ReadWritePaths=/var/lib/e3-security-analyst
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=e3-analyst
+
+[Install]
+WantedBy=multi-user.target
