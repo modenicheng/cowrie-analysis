@@ -259,8 +259,9 @@ func rawString(raw map[string]json.RawMessage, key string) (string, bool) {
 	return s, true
 }
 
-// truncateRunes 把字符串截断到最多 max 个 rune（用于 raw.message 输出）。
-func truncateRunes(s string, max int) string {
+// TruncateRunes 把字符串截断到最多 max 个 rune。query_events 的
+// raw.message 输出与 reports 的通知摘要截断共用。
+func TruncateRunes(s string, max int) string {
 	if utf8.RuneCountInString(s) <= max {
 		return s
 	}

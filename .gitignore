@@ -11,7 +11,9 @@ e3-script-runner
 *.db-shm
 /state/
 /var/
-reports/
+# 锚定仓库根：仅忽略根目录的报告归档目录；未锚定的 reports/ 会连源码包
+# internal/reports/ 一并忽略，导致该包从未进入版本库（克隆后无法构建）。
+/reports/
 
 # 本地配置与凭据（绝不提交）
 config.local.yaml

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/modenc/e3-security-analyst/internal/config"
 	"github.com/modenc/e3-security-analyst/internal/llm"
 	"github.com/modenc/e3-security-analyst/internal/query"
 	"github.com/modenc/e3-security-analyst/internal/store"
@@ -107,7 +108,7 @@ func (d *Dispatcher) handleQueryEvents(ctx context.Context, call llm.ToolCall, w
 	budget := maxEventsBytes
 	var lastID int64
 	for i, e := range events {
-		b, err := json.Marshal(d.trimEvent(e))
+		b, err := json.Marshal(TrimEvent(d.cfg, e))
 		if err != nil {
 			return "", fmt.Errorf("query_events 序列化事件 id=%d 失败: %w", e.ID, err)
 		}
@@ -150,7 +151,9 @@ func (d *Dispatcher) handleQueryEvents(ctx context.Context, call llm.ToolCall, w
 	return string(out), nil
 }
 
-// trimEvent 构造单条事件的裁剪输出对象（§9/§13 字段矩阵）：
+// TrimEvent 构造单条事件的裁剪输出对象（§9/§13 字段矩阵）。这是字段
+// 裁剪口径的唯一实现，query_events（模型工具输出）与 reports 的关键事件
+// 采样（提示词注入）共用，保证模型在两条路径看到的事件字段完全一致：
 //
 //	id/event_id/time/src_port/session/username/duration_s 恒定输出；
 //	src_ip 受 reports.include_source_ips 控制（关闭时输出 src_ip_omitted）；
@@ -161,7 +164,7 @@ func (d *Dispatcher) handleQueryEvents(ctx context.Context, call llm.ToolCall, w
 //	raw 全文与其余字段一律不输出（模型需要细节时引用 event id 人工复查）。
 //
 // Agent 自身凭据（API Key/Token 等）从不进入本函数的任何输出。
-func (d *Dispatcher) trimEvent(e *store.Event) map[string]any {
+func TrimEvent(cfg *config.Config, e *store.Event) map[string]any {
 	m := map[string]any{
 		"id":         e.ID,
 		"event_id":   e.EventID,
@@ -171,7 +174,7 @@ func (d *Dispatcher) trimEvent(e *store.Event) map[string]any {
 		"username":   e.Username,
 		"duration_s": e.DurationS,
 	}
-	if d.cfg.Reports.IncludeSourceIPs {
+	if cfg.Reports.IncludeSourceIPs {
 		m["src_ip"] = e.SrcIP
 	} else {
 		m["src_ip_omitted"] = true
@@ -183,10 +186,10 @@ func (d *Dispatcher) trimEvent(e *store.Event) map[string]any {
 		_ = json.Unmarshal([]byte(e.Raw), &raw)
 	}
 
-	if d.cfg.Reports.IncludeCommands && e.Command != "" {
+	if cfg.Reports.IncludeCommands && e.Command != "" {
 		m["command"] = e.Command
 	}
-	if d.cfg.Reports.IncludePaths {
+	if cfg.Reports.IncludePaths {
 		if e.Filename != "" {
 			m["filename"] = e.Filename
 		}
@@ -201,9 +204,9 @@ func (d *Dispatcher) trimEvent(e *store.Event) map[string]any {
 		}
 	}
 	if v, ok := rawString(raw, "message"); ok && v != "" {
-		m["message"] = truncateRunes(v, maxMessageRunes)
+		m["message"] = TruncateRunes(v, maxMessageRunes)
 	}
-	if d.cfg.LLM.IncludePasswords {
+	if cfg.LLM.IncludePasswords {
 		if v, ok := rawString(raw, "password"); ok && v != "" {
 			m["password"] = v
 		}
