@@ -8,7 +8,7 @@
 #
 # 输出：bin/linux-amd64/e3-collector、e3-analyst、e3-script-runner
 #（-trimpath -ldflags "-s -w"，CGO_ENABLED=0，纯 Go SQLite 无 CGO 依赖）。
-# cmd/analyst 暂未实现时自动跳过并提示（不报错）。
+# cmd/<name> 目录不存在时跳过并提示（不报错）。
 # =============================================================================
 set -euo pipefail
 
