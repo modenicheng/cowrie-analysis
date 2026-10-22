@@ -50,6 +50,8 @@ Cowrie JSONL 日志
 
 - **实时规则告警（不依赖 LLM）**：`cowrie.login.success` 立即高优先级通知（文案注明"蜜罐模拟登录成功（非真实系统失陷）"）；登录失败按源 IP 时间窗聚合；每会话首条命令告警；文件上传/下载附带文件名、哈希与会话 ID；全局每分钟上限超出部分合并，按周期发摘要。
 - **日报/周报**：由 systemd timer 触发（`e3-daily-report.timer` 每天 08:00、`e3-weekly-report.timer` 每周一 08:15，Asia/Shanghai），多轮工具调用 + 结构化输出 + 统计强一致校验后归档发布。
+- **报告图表（可选，`report_image.enabled`）**：发布前由 Host 基于 SQL 统计（**不经 LLM**）渲染双面板 PNG（小时/日趋势柱状图 + Top 10 来源 IP 条形图，全 ASCII 标签），经多吉云临时密钥（S3 SigV4 签名，2 小时效、单桶作用域、宿主机不留长期密钥）上传标准型存储桶获取公网直链；ntfy 通知带外链附件（`X-Attach`，Android 通知栏大图、不占 ntfy 服务端存储）与 Markdown 正文（`![](url)` 内联图，需服务端 ≥2.11.0，可配置关闭）。渲染或上传任一失败自动降级为纯文本通知，不影响报告状态机。
+- **图表与归档轮转（防远端无界累积）**：桶内图表对象按 `report_image.retention_days`（默认 90 天，0=禁用）在每次上传后 LIST+DELETE 清理；本地报告归档目录 `reports/YYYY/MM/*.{json,png}` 按 `reports.retention_days`（默认 90 天，0=禁用）由 analyst daemon 每日按文件名内嵌日期轮转；payload 中的图表 URL 在对象过期后失效属预期语义。
 - **受限 JS 分析**：模型经 `execute_js` 提交的 Goja 脚本在独立子进程执行——空环境、无网络/文件/宿主对象、超时与输入输出限额、并发信号量；每次执行写入 `script_runs` 审计表。
 - **幂等采集**：按原始行 SHA-256 去重入库；以设备号/inode（Windows 为卷序号+文件索引）记录游标；处理追加写入、半行缓冲、运行中轮转（先抽干旧文件再切新文件）、启动补读 `log_path.*` 轮转残留、进程重启恢复，不丢不重。
 - **通知去重/限流/重试**：稳定去重键（`notifications.dedupe_key` 唯一约束），429/5xx/网络错误退避重试，失败持久化待 analyst daemon（每 30s FlushPending）补发，不确定结果用去重键防止重试造成重复。
@@ -182,6 +184,7 @@ sqlite3 /tmp/e3smoke/events.db "SELECT file_key, offset, file_size FROM collecto
 | `ntfy.timeout_seconds` | `10` | 单次发布超时，范围 [1, 120] |
 | `ntfy.max_retries` | `5` | 单条通知最大尝试次数（含首次），范围 [0, 20]；耗尽后持久化待补发 |
 | `ntfy.max_message_bytes` | `4000` | 消息正文字节上限，范围 [500, 4096] |
+| `ntfy.markdown` | `true` | 报告通知正文按 Markdown 发送（`X-Markdown` 头，支持 `![](url)` 内联图与列表排版）；**需 ntfy 服务端 >= 2.11.0**，旧版本会按纯文本显示语法原文，此时可设 false |
 
 ### alerts
 
@@ -204,6 +207,18 @@ sqlite3 /tmp/e3smoke/events.db "SELECT file_key, offset, file_size FROM collecto
 | `reports.include_commands` | `true` | 是否含攻击命令原文 |
 | `reports.dir` | `""` | 报告归档目录，留空默认 `app.state_dir/reports`（0700 e3sec:e3sec） |
 | `reports.max_query_span_days` | `31` | **安全注意**：模型单次查询允许的最大时间跨度（天），范围 [1, 366]，防止无上限拉数据 |
+| `reports.retention_days` | `90` | 归档目录 `*.json`/`*.png` 文件保留期（天），analyst daemon 每日按文件名内嵌日期轮转，范围 [0, 3650]，`0`=禁用；**默认开启，属对旧版"永久保留"行为的变更** |
+
+### report_image（报告图表上传，可选）
+
+| 键 | 默认值 | 说明 |
+| --- | --- | --- |
+| `report_image.enabled` | `false` | 总开关（opt-in）。false 时行为与本功能引入前完全一致 |
+| `report_image.access_key_env` / `secret_key_env` | `DOGECLOUD_ACCESS_KEY` / `DOGECLOUD_SECRET_KEY` | 多吉云密钥的环境变量名；值经 0600 的 doge.env 注入（仅 analyst 相关 unit 加载）；enabled 时所指变量为空 → 启动即报配置错误 |
+| `report_image.bucket` | `""` | **enabled 时必填**：多吉云云存储桶名，必须是**标准型**（低频型不支持 API 上传） |
+| `report_image.public_base_url` | `""` | **enabled 时必填**：直链域名（https），如 `https://img-host.modenc.top` |
+| `report_image.key_prefix` | `e3-reports/` | 对象键前缀；完整键 = 前缀 + `{kind}/{YYYYMMDD}-{8 字节随机 hex}.png`（不可枚举） |
+| `report_image.retention_days` | `90` | 桶内图表对象保留期（天），每次上传后按 Last-Modified 清理，范围 [0, 3650]，`0`=禁用 |
 
 ## 5. 部署（Ubuntu 24.04）
 
@@ -252,11 +267,11 @@ sqlite3 /tmp/e3smoke/events.db "SELECT file_key, offset, file_size FROM collecto
 | 进程 | unit | 环境文件 | 凭据 |
 | --- | --- | --- | --- |
 | e3-collector | `e3-collector.service` | ntfy.env | 仅 `NTFY_TOKEN`（被攻破也没有 LLM 凭据） |
-| e3-analyst daemon | `e3-analyst.service` | llm.env + ntfy.env | `DEEPSEEK_API_KEY` + `NTFY_TOKEN` |
-| e3-analyst report | `e3-daily-report.service` / `e3-weekly-report.service` | llm.env + ntfy.env | 同上 |
+| e3-analyst daemon | `e3-analyst.service` | llm.env + ntfy.env + doge.env | `DEEPSEEK_API_KEY` + `NTFY_TOKEN` + 多吉云 AccessKey/SecretKey（未启用图表时 doge.env 可缺省） |
+| e3-analyst report | `e3-daily-report.service` / `e3-weekly-report.service` | llm.env + ntfy.env + doge.env | 同上 |
 | e3-script-runner | 无独立 unit（analyst 子进程） | **无** | **无任何凭据**（空环境启动，不继承任何 env 文件） |
 
-两个 env 文件（ntfy.env、llm.env）均 0600 e3sec:e3sec，由 systemd（PID 1）在降权前读取；`EnvironmentFile` 带 `-` 前缀，文件缺失仍可启动（collector 进入匿名采集模式，保证采集先行跑通）。
+三个 env 文件（ntfy.env、llm.env、doge.env）均 0600 e3sec:e3sec，由 systemd（PID 1）在降权前读取；`EnvironmentFile` 带 `-` 前缀，文件缺失仍可启动（collector 进入匿名采集模式，保证采集先行跑通）。
 
 ### Cowrie 日志路径与只读授权
 
@@ -320,6 +335,7 @@ Cowrie 日志中的命令、用户名、密码、路径、文件名、消息文�
 - **措辞约定**：Cowrie 是蜜罐，`cowrie.login.success` 一律表述为"蜜罐内模拟登录成功"，绝不表述为真实主机失陷/凭据泄露（规则告警文案同样受此约束）；空窗口如实报告为无活动；不确定结论写明置信度。
 - **数据缺口如实呈现**：采集缺口（`collector_gaps`）、解析错误（`parse_errors`）、采集停滞、查询截断、prev 缺失必须写入报告的 data_limitations，禁止生成看似完整实则掩盖缺口的报告。
 - **可追溯性**：报告归档到 `state_dir/reports/YYYY/MM/daily-YYYYMMDD.json`（如 `daily-20260102.json`，周报同目录），并落 `reports` 表（`UNIQUE(report_type, window_start)`，含 `content_sha256`、model、attempts）；分析过程记录于 `analysis_runs`（轮数、token、工具调用次数、错误），模型执行的每段 JS 记录于 `script_runs`（`run_id` 关联 `analysis_runs.id`、`code_sha256`）。失败时 `reports.status=failed` 且不发报告通知。
+- **图表产物与轮转**：开启 `report_image` 后每份报告附一张程序渲染的统计 PNG（本地归档目录留同名 `.png` 副本，payload 记 `image` 块含 url/key/sha256/bytes；图表数据全部来自 SQL 统计，不经 LLM）；桶内对象与本地归档均按保留期轮转（见"功能特性"），轮转后 payload 中的历史 URL 失效属预期。
 
 ## 8. 测试矩阵
 
@@ -332,7 +348,9 @@ Cowrie 日志中的命令、用户名、密码、路径、文件名、消息文�
 | 查询与统计 | `internal/query/query_test.go`、`stats_test.go` | 窗口左闭右开边界；跨日/北京时区窗口；字段保真；分页游标；TopSrcIPs/登录计数/用户名；会话聚合；命令截断；小时/日桶；prev 窗口对比；数据质量（gaps/parse_errors/停滞）；TopN 钳制；空窗口；JSON 标签 |
 | Goja Runner | `internal/sandbox/jsvm_test.go`、`runner_test.go` | 合法脚本；语法错误；死循环超时中断；超大输出/输入；提示词注入内容仅是数据；无宿主接口；`globalThis`/`Function` 无宿主访问；深递归/抛错/不可序列化的结构化错误；子进程端到端；子进程超时强杀；**环境隔离（空环境）**；并发信号量；script-runner 二进制坏输入 |
 | DeepSeek | `internal/llm/client_test.go` | JSON 模式单轮；多轮工具循环；非法 JSON 响应；429 退避重试（含 Retry-After）；5xx 重试后失败；401 不重试；请求超时；非法工具参数回传模型；工具轮数上限；响应字段缺失；无 API Key；代码栅栏剥离；Token 预算超限；上下文取消 |
-| ntfy | `internal/ntfy/client_test.go`、`publisher_test.go` | 正常发布；认证失败（不可重试）；429/5xx/超时（可重试）；正文超限/非法主题/非法优先级本地拒绝；匿名省略 Authorization；标题安全截断；入队去重与 Bump；TrySend 重试与耗尽；FlushPending 计数与摘要跳过 |
+| ntfy | `internal/ntfy/client_test.go`、`publisher_test.go` | 正常发布；认证失败（不可重试）；429/5xx/超时（可重试）；正文超限/非法主题/非法优先级本地拒绝；匿名省略 Authorization；标题安全截断；附件/Markdown 头存在与缺席；非法附件 URL 本地拒绝；入队去重与 Bump；TrySend 重试与耗尽；FlushPending 计数与摘要跳过 |
+| 对象存储 | `internal/dogecloud/dogecloud_test.go` | 临时密钥 HMAC-SHA1 签名 golden；SigV4 PUT/DELETE/LIST 签名 golden（含 AWS 官方公开向量）；双字段风格解析；假 API+假 S3 上传全链路；Prune 删旧留新/分页/部分失败继续/0=禁用；NewKey 格式；错误文本不泄密钥 |
+| 报告图表 | `internal/chartimg/chartimg_test.go` | PNG magic 与宽高；零事件窗口；24 小时/7 日桶补零（乱序/窗口外/解析失败）；asciiSafe（非 ASCII→?）；标题内容与 UTC 偏移后缀；未知 kind 报错；并发渲染 |
 | 规则告警 | `internal/rules/engine_test.go` | login.success 立即发送与会话去重；文件上传告警与去重；login.failed 聚合触发与递进；每会话首条命令（含重启后不重复）；connect 洪水汇总；全局限流与 digest 汇总 |
 | 存储与调度 | `internal/store/*_test.go`、`internal/scheduler/window_test.go` | Open/Migrate 幂等与顺序；插入去重（raw SHA-256）；会话跨批次聚合；游标/健康/缺口/解析错误往返；通知生命周期；报告 upsert/失败列表；analysis_runs、script_runs 往返；**保留清理（各表判据/notifications 只删 sent/0=禁用/分批循环/幂等/0002 升级回填）**；daily/weekly 窗口跨月跨年/周日/UTC/时区转换；PrevWindow |
 | 工具调度 | `internal/tools/*_test.go` | query_events 默认窗口/字段剪裁/跨度校验/limit 钳制/字节预算；query_stats 透传与 TopN；execute_js 禁用态/成功审计/脚本错误/输入超限/超时钳制；submit_report 接受/类型不匹配/校验/拒绝/禁止键/未知字段容忍；Specs 合法与未知工具 |

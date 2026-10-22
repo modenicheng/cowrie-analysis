@@ -4,8 +4,10 @@
 #（analyst daemon 子命令）。
 #
 # 权限与凭据（SPEC §14）：
-#   - 凭据 DEEPSEEK_API_KEY（llm.env）+ NTFY_TOKEN（ntfy.env），两个文件均须
-#     0600、owner e3sec:e3sec，由 systemd(PID 1) 在降权前读取。
+#   - 凭据 DEEPSEEK_API_KEY（llm.env）+ NTFY_TOKEN（ntfy.env）+ 多吉云
+#     AccessKey/SecretKey（doge.env，报告图表上传用；report_image.enabled=false
+#     时文件可缺省），各文件均须 0600、owner e3sec:e3sec，由 systemd(PID 1) 在
+#     降权前读取。
 #   - 这些凭据绝不能进入 script-runner 子进程：analyst 以"空环境"启动
 #     runner（代码层强制，Env 置空），凭据不继承（SPEC §9/§18）。
 #   - '/var/lib/e3-security-analyst 可写（报告归档/通知状态）。
@@ -23,6 +25,7 @@ User=e3sec
 Group=e3sec
 EnvironmentFile=-/etc/e3-security-analyst/llm.env
 EnvironmentFile=-/etc/e3-security-analyst/ntfy.env
+EnvironmentFile=-/etc/e3-security-analyst/doge.env
 ExecStart=/usr/local/bin/e3-analyst daemon --config /etc/e3-security-analyst/config.yaml
 Restart=always
 RestartSec=5s

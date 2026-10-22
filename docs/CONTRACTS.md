@@ -71,6 +71,8 @@ type Notification struct {
     DedupeKey   string // 稳定去重键（唯一约束），重试/重启不重复发送
     Kind        string // 如 alert.login_success / alert.login_failed / report.daily
     Topic, Title, Body, Tags string // Tags 为逗号分隔
+    Attach      string // 外链附件 URL（X-Attach）；空则不携带（迁移 0003 新列）
+    Markdown    bool   // 正文是否按 Markdown 发送（迁移 0003 新列）
     Priority    int    // ntfy 1..5
     Status      string // pending|sent|failed
     Attempts    int
@@ -208,10 +210,12 @@ type StatsQuery struct {
 // Client 单次发布；重试策略由 Publisher 编排。
 type ClientConfig struct{ BaseURL, Token string; Timeout time.Duration }
 func NewClient(cfg ClientConfig) *Client
-type Message struct{ Topic, Title, Body string; Priority int; Tags []string }
+type Message struct{ Topic, Title, Body string; Priority int; Tags []string; Attach string; Markdown bool }
 type PublishOutcome struct{ HTTPStatus int; ResponseID string; SentAt time.Time }
 func (c *Client) Publish(ctx context.Context, m Message) (PublishOutcome, error)
 // 2xx → nil error。4xx（除 429）不可重试；429/5xx/网络错误可重试。
+// Attach 非空 → 发 X-Attach（须合法 http(s) URL、≤2048 字节，否则本地
+// ValidationError）；Markdown=true → 发 "Markdown: yes"。两者缺席时行为不变。
 func IsRetryable(err error) bool
 
 // Publisher 持久化队列：入队去重、立即发送、失败留待重试。
@@ -223,6 +227,54 @@ func (p *Publisher) TrySend(ctx context.Context, n *store.Notification) error
 // FlushPending 扫描 pending 并重试，返回 (sent, failedPermanent)。
 func (p *Publisher) FlushPending(ctx context.Context) (int, int, error)
 ```
+
+## internal/dogecloud （多吉云对象存储上传/清理；仅标准库）
+
+```go
+type Config struct {
+    AccessKey, SecretKey string // 运行时从 doge.env 解析；绝不出现在日志/错误
+    Bucket        string        // 标准型存储桶（低频型不支持 API 上传）
+    PublicBaseURL string        // 直链域名，如 https://img-host.modenc.top
+    KeyPrefix     string        // 如 "e3-reports/"
+    APIBaseURL    string        // 留空 → https://api.dogecloud.com（测试注入用）
+    RetentionDays int           // 桶内对象保留期；<=0 禁用清理
+    Timeout       time.Duration // <=0 → 10s
+}
+func New(cfg Config, hc *http.Client) *Client
+// FetchTmpToken 仅换取临时密钥（verify 自检，零副作用）：
+// POST /auth/tmp_token.json，body {"channel":"OSS_UPLOAD","scopes":["<bucket>:*"]}，
+// Authorization: TOKEN <AK>:<hex HMAC-SHA1(SK, path+"\n"+bodyJSON)>；
+// 响应 data.Credentials（AccessKeyId/SecretAccessKey/SessionToken，兼容小写变体）
+// + data.Buckets[0].s3Bucket/s3Endpoint。临时密钥 ≤2h，每次现换不缓存。
+func (c *Client) FetchTmpToken(ctx context.Context) error
+// NewKey 生成不可猜对象键：{KeyPrefix 规范尾斜杠}{kind}/{YYYYMMDD}-{crypto/rand 8 字节 hex}.png
+func (c *Client) NewKey(kind string, since time.Time) string
+// Upload：换临时密钥 → 对 s3Endpoint 发 SigV4 PUT（virtual-host 风格 bucket.host、
+// region "auto"、签名头 host;x-amz-content-sha256;x-amz-date[;x-amz-security-token]）
+// → 返回 PublicBaseURL 去尾斜杠 + "/" + key。不内置重试，失败即由调用方降级。
+func (c *Client) Upload(ctx context.Context, key string, data []byte, contentType string) (publicURL string, err error)
+// Prune：配置校验通过且 RetentionDays<=0 → (0, nil)（配置缺失时仍报错，不以禁用
+// 掩盖）。LIST prefix=KeyPrefix 分页遍历，Last-Modified 早于 now-保留期 的对象逐个
+// SigV4 DELETE；单对象失败记录后继续，返回成功删除数与首个遇到的删除错误。
+// LIST 本身失败 → (0, err)。Last-Modified 无法解析的对象跳过不删（保守防误删）。
+func (c *Client) Prune(ctx context.Context) (deleted int, err error)
+```
+
+约束：任何错误文本与包装链不得包含 SecretKey 或临时凭据值（可含 bucket/key/HTTP 状态码/endpoint host）。
+
+## internal/chartimg （报告图表 PNG 渲染；新增依赖 wcharczuk/go-chart/v2，间接仅 golang/freetype 与 golang.org/x/image）
+
+```go
+func New(loc *time.Location) *Renderer // loc 为展示时区；nil → UTC
+func (r *Renderer) Render(stats *query.Stats, kind string) ([]byte, error)
+```
+
+kind 仅接受 daily|weekly。输出单张合成 PNG（约 1000px 宽，双面板以 stdlib
+image/draw 纵向拼接）：面板 A 趋势柱状图（daily=24 小时桶 / weekly=7 日桶；
+Stats.Hourly/Daily 为 UTC "2006-01-02T15"/"2006-01-02"，转 loc 展示，
+[Since,Until) 全区间补零）；面板 B TopSrcIPs 前 10 横向条形图（值=Connections，
+为空时渲染 no-data 占位）。图表文本全 ASCII（asciiSafe 清洗；v1 不内嵌 CJK 字体）。
+零事件窗口仍产出合法 PNG。
 
 ## internal/llm （OpenAI 兼容客户端，DeepSeek）
 
@@ -335,13 +387,31 @@ submit_report：仅接受固定字段，type 必须等于任务窗口 Type，长
 func WindowFor(kind string, now time.Time, loc *time.Location) (since, until time.Time, err error)
 // ↑ 已由 internal/scheduler 实现（scheduler.WindowFor / scheduler.PrevWindow）
 
-type Generator struct{ /* cfg, db, llm, dispatcher, pub, log */ }
+type Generator struct{ /* cfg, db, llm, dispatcher, pub, imager, log */ }
 // NewGenerator 内部自行创建 tools.Dispatcher（submitter 为 Generator 自身的草稿校验器）。
 // runner 为 nil 或 cfg.ScriptRunner.Enabled=false 时 execute_js 不可用。
 // runner 由调用方传入；二进制缺失或禁用时由 cmd/analyst 先降级为 nil 并 Warn 再构造。
+// imager 为 nil 时无图表（现行为）；具体适配器由 cmd/analyst 用 dogecloud.Client +
+// chartimg.Renderer 组装——reports 包不直接依赖这两个包。SetImager/SetNotifyMarkdown
+// 必须在首次 Generate 前调用（NotifyMarkdown 默认 true，来自 cfg.Ntfy.Markdown）。
+type ReportImager interface {
+    Render(stats *query.Stats, kind string, since, until time.Time) ([]byte, error)
+    Upload(ctx context.Context, kind string, since time.Time, png []byte) (key, publicURL string, err error)
+    Prune(ctx context.Context) error
+}
 func NewGenerator(cfg *config.Config, db *store.DB, client *llm.Client,
     runner *sandbox.Runner, pub *ntfy.Publisher, log *slog.Logger) (*Generator, error)
+func (g *Generator) SetImager(imager ReportImager)
+func (g *Generator) SetNotifyMarkdown(v bool)
 func (g *Generator) Generate(ctx context.Context, kind string) error
+// 图表步骤（imager 非 nil 且 report_image.enabled）：草稿校验后 render→upload→prune，
+// 任一失败仅 log.Warn 并降级为纯文本通知，不影响报告状态机；payload 增可选 image 块
+// {url,key,sha256,bytes,generated_at}；归档目录写 {kind}-{YYYYMMDD}.png 副本（0600）；
+// 通知 Attach=直链、Markdown 按 cfg.Ntfy.Markdown。纯文本正文路径保持逐字节不变。
+// Markdown 变体的 summary/finding 标题经 escapeCommonMark 转义（先 \ 后 [、<，
+// severity 已枚举校验不转义）——回显的攻击者内容无法组成链接/图片/自动链接。
+// CleanupArchives 按文件名内嵌日期轮转归档目录 .json/.png（0 禁用），由 daemon 每日调用。
+func CleanupArchives(dir string, retentionDays int, now time.Time) error
 // 流程（§8.1）：算窗口→SQL统计→关键事件→LLM（带工具）→submit_report 校验
 // （key_stats 必须与 SQL 统计一致，否则拒绝并让模型修正一轮）→归档
 // state_dir/reports/YYYY/MM/daily-20060102.json（紧凑日期，周报 weekly-YYYYMMDD.json）+ reports 表 + ntfy 发布。
@@ -353,5 +423,7 @@ func (g *Generator) Generate(ctx context.Context, kind string) error
 
 - `cmd/collector`：加载配置 → store.Open+Migrate → rules engine（alerts.enabled）→ collector.Run。
 - `cmd/analyst`：子命令 `report --type daily|weekly`（oneshot，systemd timer 触发）、
-  `daemon`（常驻：每 30s FlushPending 通知 + 每 10min 重试失败报告）、`verify`（配置/环境自检）。
+  `daemon`（常驻：每 30s FlushPending 通知 + 每 10min 重试失败报告 + 每日
+  CleanupArchives 归档轮转）、`verify`（配置/环境自检；report_image.enabled 时
+  含多吉云临时密钥换取检查）。report_image.enabled 且密钥 env 缺失时启动即报错。
 - `cmd/script-runner`：stdin 任务 JSON → sandbox.RunCode → stdout 结果 JSON（见 internal/sandbox）。
