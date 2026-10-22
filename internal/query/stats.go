@@ -104,6 +104,17 @@ type Stats struct {
 	Hourly []KV `json:"hourly"` // UTC 桶 "2006-01-02T15"
 	Daily  []KV `json:"daily"`  // UTC 桶 "2006-01-02"
 
+	// 分指标趋势桶（多序列折线图用），键格式同 Hourly/Daily；仅含
+	// 计数 > 0 的桶，全窗口补零由展示层（chartimg）负责。
+	HourlyConnections  []KV `json:"hourly_connections,omitempty"`
+	HourlyLoginFailed  []KV `json:"hourly_login_failed,omitempty"`
+	HourlyLoginSuccess []KV `json:"hourly_login_success,omitempty"`
+	HourlyCommands     []KV `json:"hourly_commands,omitempty"`
+	DailyConnections   []KV `json:"daily_connections,omitempty"`
+	DailyLoginFailed   []KV `json:"daily_login_failed,omitempty"`
+	DailyLoginSuccess  []KV `json:"daily_login_success,omitempty"`
+	DailyCommands      []KV `json:"daily_commands,omitempty"`
+
 	Prev    *PrevDelta  `json:"prev,omitempty"` // 紧邻前一同长窗口；不足（太早）时为 nil
 	Quality QualityInfo `json:"quality"`
 }
@@ -416,7 +427,60 @@ func computeTrends(ctx context.Context, sdb *sql.DB, since, until time.Time, st 
 		return fmt.Errorf("Daily 查询失败: %w", err)
 	}
 	st.Daily = append(st.Daily, daily...)
+
+	if err := computeMetricTrends(ctx, sdb, since, until, "substr(event_time, 1, 13)",
+		&st.HourlyConnections, &st.HourlyLoginFailed, &st.HourlyLoginSuccess, &st.HourlyCommands); err != nil {
+		return fmt.Errorf("Hourly 分指标查询失败: %w", err)
+	}
+	if err := computeMetricTrends(ctx, sdb, since, until, "substr(event_time, 1, 10)",
+		&st.DailyConnections, &st.DailyLoginFailed, &st.DailyLoginSuccess, &st.DailyCommands); err != nil {
+		return fmt.Errorf("Daily 分指标查询失败: %w", err)
+	}
 	return nil
+}
+
+// computeMetricTrends 按事件类型分列计算单粒度（小时/日）趋势桶：
+// bucketExpr 为桶表达式，四列依次写入 conn/failed/success/commands；
+// 某指标在该桶计数为 0 时不产生条目（省略语义，补零归展示层）。
+// 事件口径与 queryCoreCounts 一致（connect/login.failed/login.success/
+// command.input）。
+func computeMetricTrends(ctx context.Context, sdb *sql.DB, since, until time.Time,
+	bucketExpr string, conn, failed, success, commands *[]KV) error {
+	win, winArgs := windowConds(since, until)
+	args := append([]any{cowrie.EventConnect, cowrie.EventLoginFailed,
+		cowrie.EventLoginSuccess, cowrie.EventCommandInput}, winArgs...)
+	args = append(args, maxBuckets)
+	rows, err := sdb.QueryContext(ctx, `SELECT `+bucketExpr+` AS bucket,
+			SUM(CASE WHEN event_id = ? THEN 1 ELSE 0 END),
+			SUM(CASE WHEN event_id = ? THEN 1 ELSE 0 END),
+			SUM(CASE WHEN event_id = ? THEN 1 ELSE 0 END),
+			SUM(CASE WHEN event_id = ? THEN 1 ELSE 0 END)
+		FROM events WHERE `+win+`
+		GROUP BY bucket ORDER BY bucket ASC LIMIT ?`, args...)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var v string
+		var c, f, s, m int
+		if err := rows.Scan(&v, &c, &f, &s, &m); err != nil {
+			return err
+		}
+		if c > 0 {
+			*conn = append(*conn, KV{Value: v, Count: c})
+		}
+		if f > 0 {
+			*failed = append(*failed, KV{Value: v, Count: f})
+		}
+		if s > 0 {
+			*success = append(*success, KV{Value: v, Count: s})
+		}
+		if m > 0 {
+			*commands = append(*commands, KV{Value: v, Count: m})
+		}
+	}
+	return rows.Err()
 }
 
 // computePrev 计算紧邻 Since 之前的同长窗口对比；前窗开始时间早于

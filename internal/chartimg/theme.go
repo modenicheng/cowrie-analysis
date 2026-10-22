@@ -24,16 +24,20 @@ var (
 
 	accent = drawing.Color{R: 34, G: 211, B: 238, A: 255} // 强调青 #22D3EE
 
-	// 平色柱体：常规青、峰值亮青、Top IP 榜首紫。
-	barCyan     = drawing.Color{R: 6, G: 182, B: 212, A: 255}   // #06B6D4
-	peakCyan    = drawing.Color{R: 103, G: 232, B: 249, A: 255} // #67E8F9
-	rank1Purple = drawing.Color{R: 168, G: 85, B: 247, A: 255}  // #A855F7
+	// 平色柱体与折线：常规青、Top IP 榜首紫；折线序列 connections 复用
+	// barCyan，其余三色见下。
+	barCyan     = drawing.Color{R: 6, G: 182, B: 212, A: 255}  // #06B6D4
+	rank1Purple = drawing.Color{R: 168, G: 85, B: 247, A: 255} // #A855F7
+
+	// 折线序列配色（平色）。
+	lineAmber  = drawing.Color{R: 245, G: 158, B: 11, A: 255}  // login_failed #F59E0B
+	lineRed    = drawing.Color{R: 248, G: 113, B: 113, A: 255} // login_success #F87171
+	lineViolet = drawing.Color{R: 167, G: 139, B: 250, A: 255} // commands #A78BFA
 )
 
 // 面板柱体的平色样式。
 var (
 	barStyle   = chart.Style{FillColor: barCyan}
-	peakStyle  = chart.Style{FillColor: peakCyan}
 	rank1Style = chart.Style{FillColor: rank1Purple}
 )
 

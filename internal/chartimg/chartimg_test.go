@@ -256,10 +256,10 @@ func TestTitleContent(t *testing.T) {
 		want string
 	}{
 		{"daily report", reportTitle(dailyStats(), KindDaily, shanghai), "E3 Daily Report 2026-10-21"},
-		{"trend hourly", trendPanelTitle("hour", shanghai, dailyStats().Since), "Connections per hour (UTC+8)"},
-		{"trend daily utc", trendPanelTitle("day", time.UTC, dailyStats().Since), "Connections per day (UTC)"},
-		{"trend half offset", trendPanelTitle("hour", kolkata, dailyStats().Since), "Connections per hour (UTC+05:30)"},
-		{"trend negative offset", trendPanelTitle("hour", laPDT, dailyStats().Since), "Connections per hour (UTC-7)"},
+		{"trend hourly", trendPanelTitle("hour", shanghai, dailyStats().Since), "Activity per hour (UTC+8)"},
+		{"trend daily utc", trendPanelTitle("day", time.UTC, dailyStats().Since), "Activity per day (UTC)"},
+		{"trend half offset", trendPanelTitle("hour", kolkata, dailyStats().Since), "Activity per hour (UTC+05:30)"},
+		{"trend negative offset", trendPanelTitle("hour", laPDT, dailyStats().Since), "Activity per hour (UTC-7)"},
 	}
 	for _, tt := range tests {
 		if tt.got != tt.want {
@@ -364,15 +364,40 @@ func TestIntTicks(t *testing.T) {
 	}
 }
 
-// 13. 趋势桶标签经 trendBuckets 正确选择稀疏步长。
-func TestTrendBucketsKind(t *testing.T) {
-	buckets, every, unit := trendBuckets(dailyStats(), KindDaily, shanghai)
-	if len(buckets) != dailyBucketCount || every != trendLabelEvery || unit != "hour" {
-		t.Errorf("daily trendBuckets = (%d buckets, every %d, %q), want (24, 3, hour)", len(buckets), every, unit)
+// 13. trendSeriesList 按 kind 生成四条等长、索引对齐的补零序列，
+// 且各序列读取对应分指标字段。
+func TestTrendSeriesList(t *testing.T) {
+	series := trendSeriesList(dailyStats(), KindDaily, shanghai)
+	if len(series) != 4 {
+		t.Fatalf("daily series 数 = %d, want 4", len(series))
 	}
-	buckets, every, unit = trendBuckets(weeklyStats(), KindWeekly, shanghai)
-	if len(buckets) != weeklyBucketCount || every != 1 || unit != "day" {
-		t.Errorf("weekly trendBuckets = (%d buckets, every %d, %q), want (7, 1, day)", len(buckets), every, unit)
+	for i, s := range series {
+		if len(s.bkts) != dailyBucketCount {
+			t.Errorf("series[%d] 桶数 = %d, want %d", i, len(s.bkts), dailyBucketCount)
+		}
+		if s.name == "" || s.color.A == 0 {
+			t.Errorf("series[%d] 名称/颜色未设置: %q %+v", i, s.name, s.color)
+		}
+	}
+	ws := trendSeriesList(weeklyStats(), KindWeekly, shanghai)
+	if len(ws) != 4 || len(ws[0].bkts) != weeklyBucketCount {
+		t.Errorf("weekly series 异常: %d 条, 首序列 %d 桶", len(ws), len(ws[0].bkts))
+	}
+
+	// 分指标字段映射：仅 HourlyLoginFailed 有数据时 failed 序列含该桶。
+	st := dailyStats()
+	st.HourlyLoginFailed = []query.KV{{Value: "2026-10-21T07", Count: 5}}
+	failed := trendSeriesList(st, KindDaily, shanghai)[1]
+	hit := 0
+	for _, b := range failed.bkts {
+		if b.Count == 5 {
+			hit++
+		} else if b.Count != 0 {
+			t.Errorf("login_failed 序列出现非零桶 %+v", b)
+		}
+	}
+	if hit != 1 {
+		t.Errorf("login_failed 序列应恰含 1 个计数 5 的桶, 实际 %d", hit)
 	}
 }
 

@@ -193,6 +193,9 @@ type Stats struct {
     Uploads, Downloads, DownloadFailed int
     Artifacts   []FileArtifact
     Hourly, Daily []KV  // UTC 桶："2006-01-02T15" / "2006-01-02"
+    // 分指标趋势桶（多序列折线图用），仅含计数>0 的桶，补零归展示层：
+    HourlyConnections/HourlyLoginFailed/HourlyLoginSuccess/HourlyCommands []KV
+    DailyConnections/DailyLoginFailed/DailyLoginSuccess/DailyCommands     []KV
     Prev  *PrevDelta    // 与紧邻前一个同长窗口比较；不足时为 nil
     Quality QualityInfo
 }
@@ -270,11 +273,12 @@ func (r *Renderer) Render(stats *query.Stats, kind string) ([]byte, error)
 ```
 
 kind 仅接受 daily|weekly。输出单张合成 PNG（约 1000px 宽，双面板以 stdlib
-image/draw 纵向拼接）：面板 A 趋势柱状图（daily=24 小时桶 / weekly=7 日桶；
-Stats.Hourly/Daily 为 UTC "2006-01-02T15"/"2006-01-02"，转 loc 展示，
-[Since,Until) 全区间补零）；面板 B TopSrcIPs 前 10 横向条形图（值=Connections，
-为空时渲染 no-data 占位）。图表文本全 ASCII（asciiSafe 清洗；v1 不内嵌 CJK 字体）。
-零事件窗口仍产出合法 PNG。
+image/draw 纵向拼接）：面板 A 多序列活动折线（connections/login_failed/
+login_success/commands 四序列同框，来自 Hourly*/Daily* 分指标序列并
+[Since,Until) 全区间补零；标题下列图例，全局峰值点标注数值）；面板 B
+TopSrcIPs 前 10 横向条形图（值=Connections，为空时渲染 no-data 占位）。
+图表文本全 ASCII（asciiSafe 清洗；v1 不内嵌 CJK 字体）。深色平色主题
+（theme.go）。零事件窗口仍产出合法 PNG。
 
 ## internal/llm （OpenAI 兼容客户端，DeepSeek）
 

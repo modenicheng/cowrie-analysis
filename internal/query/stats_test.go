@@ -328,6 +328,57 @@ func TestStatsHourlyDailyBuckets(t *testing.T) {
 	}
 }
 
+// TestStatsMetricTrendBuckets：分指标趋势桶按事件类型分列（connect/
+// login.failed/login.success/command.input），零计数的桶不产生条目；
+// 全零序列序列化为空（omitempty）。
+func TestStatsMetricTrendBuckets(t *testing.T) {
+	db := openTestDB(t)
+	d := time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC)
+	mustInsert(t, db,
+		ev(cowrie.EventConnect, d),
+		ev(cowrie.EventConnect, d.Add(time.Hour)),
+		ev(cowrie.EventLoginFailed, d),
+		ev(cowrie.EventLoginFailed, d.Add(time.Minute)),
+		ev(cowrie.EventCommandInput, d.Add(2*time.Hour)),
+		ev(cowrie.EventFileUpload, d.Add(3*time.Hour)), // 其他类型：四个序列均不计数
+	)
+	st := mustStats(t, db, StatsQuery{Since: d, Until: d.Add(24 * time.Hour)})
+
+	assertKVs := func(name string, got []KV, want []KV) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s = %+v, 期望 %+v", name, got, want)
+		}
+		for i, w := range want {
+			if got[i] != w {
+				t.Errorf("%s[%d] = %+v, 期望 %+v", name, i, got[i], w)
+			}
+		}
+	}
+	assertKVs("HourlyConnections", st.HourlyConnections,
+		[]KV{{Value: "2026-10-21T00", Count: 1}, {Value: "2026-10-21T01", Count: 1}})
+	assertKVs("HourlyLoginFailed", st.HourlyLoginFailed,
+		[]KV{{Value: "2026-10-21T00", Count: 2}})
+	assertKVs("HourlyLoginSuccess", st.HourlyLoginSuccess, nil)
+	assertKVs("HourlyCommands", st.HourlyCommands,
+		[]KV{{Value: "2026-10-21T02", Count: 1}})
+	assertKVs("DailyConnections", st.DailyConnections,
+		[]KV{{Value: "2026-10-21", Count: 2}})
+	assertKVs("DailyLoginFailed", st.DailyLoginFailed,
+		[]KV{{Value: "2026-10-21", Count: 2}})
+
+	// omitempty：无成功登录 → 分指标序列键不出现在 JSON 中
+	//（顶层标量 login_success 仍在）。
+	b, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("Marshal 失败: %v", err)
+	}
+	if strings.Contains(string(b), "hourly_login_success") ||
+		strings.Contains(string(b), "daily_login_success") {
+		t.Errorf("全零序列应被省略，实际 JSON:\n%s", b)
+	}
+}
+
 // TestStatsFileArtifacts：上传/下载/下载失败计数与 Artifacts 聚合
 // （filename+shasum+方向+次数）；失败变体不进入 Artifacts。
 func TestStatsFileArtifacts(t *testing.T) {
@@ -575,6 +626,7 @@ func TestStatsJSONTags(t *testing.T) {
 		"top_commands", "event_kinds", "sessions_total", "sessions_with_commands",
 		"avg_session_seconds", "max_session_seconds", "uploads", "downloads",
 		"download_failed", "artifacts", "hourly", "daily", "prev", "quality",
+		"hourly_connections",
 	} {
 		if _, ok := m[key]; !ok {
 			t.Errorf("Stats JSON 缺少键 %q", key)

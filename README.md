@@ -50,7 +50,7 @@ Cowrie JSONL 日志
 
 - **实时规则告警（不依赖 LLM）**：`cowrie.login.success` 立即高优先级通知（文案注明"蜜罐模拟登录成功（非真实系统失陷）"）；登录失败按源 IP 时间窗聚合；每会话首条命令告警；文件上传/下载附带文件名、哈希与会话 ID；全局每分钟上限超出部分合并，按周期发摘要。
 - **日报/周报**：由 systemd timer 触发（`e3-daily-report.timer` 每天 08:00、`e3-weekly-report.timer` 每周一 08:15，Asia/Shanghai），多轮工具调用 + 结构化输出 + 统计强一致校验后归档发布。
-- **报告图表（可选，`report_image.enabled`）**：发布前由 Host 基于 SQL 统计（**不经 LLM**）渲染双面板 PNG（小时/日趋势柱状图 + Top 10 来源 IP 条形图，全 ASCII 标签），经多吉云临时密钥（S3 SigV4 签名，2 小时效、单桶作用域、宿主机不留长期密钥）上传标准型存储桶获取公网直链；ntfy 通知带外链附件（`X-Attach`，Android 通知栏大图、不占 ntfy 服务端存储）与 Markdown 正文（`![](url)` 内联图，需服务端 ≥2.11.0，可配置关闭）。渲染或上传任一失败自动降级为纯文本通知，不影响报告状态机。
+- **报告图表（可选，`report_image.enabled`）**：发布前由 Host 基于 SQL 统计（**不经 LLM**）渲染双面板 PNG（四序列活动折线：connections/login_failed/login_success/commands 同框对比 + 图例与峰值标注；Top 10 来源 IP 条形图；全 ASCII 标签，深色平色主题），经多吉云临时密钥（S3 SigV4 签名，2 小时效、单桶作用域、宿主机不留长期密钥）上传标准型存储桶获取公网直链；ntfy 通知带外链附件（`X-Attach`，Android 通知栏大图、不占 ntfy 服务端存储）与 Markdown 正文（`![](url)` 内联图，需服务端 ≥2.11.0，可配置关闭）。渲染或上传任一失败自动降级为纯文本通知，不影响报告状态机。
 - **图表与归档轮转（防远端无界累积）**：桶内图表对象按 `report_image.retention_days`（默认 90 天，0=禁用）在每次上传后 LIST+DELETE 清理；本地报告归档目录 `reports/YYYY/MM/*.{json,png}` 按 `reports.retention_days`（默认 90 天，0=禁用）由 analyst daemon 每日按文件名内嵌日期轮转；payload 中的图表 URL 在对象过期后失效属预期语义。
 - **受限 JS 分析**：模型经 `execute_js` 提交的 Goja 脚本在独立子进程执行——空环境、无网络/文件/宿主对象、超时与输入输出限额、并发信号量；每次执行写入 `script_runs` 审计表。
 - **幂等采集**：按原始行 SHA-256 去重入库；以设备号/inode（Windows 为卷序号+文件索引）记录游标；处理追加写入、半行缓冲、运行中轮转（先抽干旧文件再切新文件）、启动补读 `log_path.*` 轮转残留、进程重启恢复，不丢不重。

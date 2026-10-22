@@ -29,9 +29,9 @@ const (
 
 	trendPlotLeft     = 76 // 趋势面板绘图区左界（卡片内留 y 轴刻度文本）
 	trendHMarginRight = 36 // 绘图区右界内边距
-	trendPlotTop      = 60 // 绘图区顶界（面板标题之下留白）
+	trendPlotTop      = 78 // 绘图区顶界（面板标题与图例行之下）
 	trendXReserve     = 56 // 底部为 x 轴刻度与标签预留的高度
-	trendMaxBarWidth  = 64 // 单柱最大宽度（weekly 仅 7 柱时防止过宽）
+	legendY           = 52 // 趋势面板图例行中心 y（标题与绘图区之间）
 
 	topIPBaseHeight  = 170            // Top IP 面板固定高度（卡片 + 标题 + 数值轴 + 留白）
 	topIPRowHeight   = 32             // 每个 IP 行高
@@ -60,11 +60,43 @@ func renderHeader(title string) (image.Image, error) {
 	return imageFromRenderer(r, "标题条")
 }
 
-// renderTrendPanel 手绘趋势面板：daily 用 Hourly 补零后的 24 个小时桶，
-// weekly 用 Daily 补零后的 7 个日桶。左侧 y 轴整数刻度 + 弱化横向网格线，
-// 平色纵向柱（峰值柱高亮并在柱顶标数值），底部 x 轴基线与稀疏刻度标签。
+// trendSeries 是趋势面板的一条折线序列。
+type trendSeries struct {
+	name  string        // 图例名（ASCII）
+	color drawing.Color // 线色（平色）
+	bkts  []bucket      // 补零后的桶（各序列等长、按索引对齐）
+}
+
+// trendSeriesList 按 kind 取多序列折线：connections/login_failed/
+// login_success/commands，口径与 query.ComputeStats 核心计数一致
+// （事件分桶来自 Hourly*/Daily* 分指标序列，全事件 Hourly/Daily 不参与）。
+func trendSeriesList(stats *query.Stats, kind string, loc *time.Location) []trendSeries {
+	if kind == KindDaily {
+		return []trendSeries{
+			{"connections", barCyan, hourlyBuckets(stats.HourlyConnections, stats.Since, loc)},
+			{"login_failed", lineAmber, hourlyBuckets(stats.HourlyLoginFailed, stats.Since, loc)},
+			{"login_success", lineRed, hourlyBuckets(stats.HourlyLoginSuccess, stats.Since, loc)},
+			{"commands", lineViolet, hourlyBuckets(stats.HourlyCommands, stats.Since, loc)},
+		}
+	}
+	return []trendSeries{
+		{"connections", barCyan, dailyBuckets(stats.DailyConnections, stats.Since, loc)},
+		{"login_failed", lineAmber, dailyBuckets(stats.DailyLoginFailed, stats.Since, loc)},
+		{"login_success", lineRed, dailyBuckets(stats.DailyLoginSuccess, stats.Since, loc)},
+		{"commands", lineViolet, dailyBuckets(stats.DailyCommands, stats.Since, loc)},
+	}
+}
+
+// renderTrendPanel 手绘多序列活动折线面板：daily 用 24 个小时桶、weekly
+// 用 7 个日桶，四条序列（connections/login_failed/login_success/commands）
+// 同框对比。标题下有图例行；y 轴取全序列最大值的整数刻度，全局峰值点
+// 标注数值；底部 x 轴基线与稀疏刻度标签。
 func renderTrendPanel(stats *query.Stats, kind string, loc *time.Location) (image.Image, error) {
-	buckets, labelEvery, unit := trendBuckets(stats, kind, loc)
+	labelEvery, unit := trendLabelEvery, "hour"
+	if kind == KindWeekly {
+		labelEvery, unit = 1, "day"
+	}
+	series := trendSeriesList(stats, kind, loc)
 
 	r, err := chart.PNG(imgWidth, trendHeight)
 	if err != nil {
@@ -77,13 +109,31 @@ func renderTrendPanel(stats *query.Stats, kind string, loc *time.Location) (imag
 		return nil, err
 	}
 
-	maxCount := 0
-	for _, b := range buckets {
-		if b.Count > maxCount {
-			maxCount = b.Count
+	// 图例：色块 + 序列名，一行排开（标题与绘图区之间）。
+	legendStyle, err := textStyle(axisFontSize+1, mutedText)
+	if err != nil {
+		return nil, err
+	}
+	lx := cardHInset + 32
+	for _, s := range series {
+		chart.Draw.Box(r, chart.Box{Left: lx, Right: lx + 14, Top: legendY - 1, Bottom: legendY + 1},
+			chart.Style{FillColor: s.color})
+		tb := chart.Draw.MeasureText(r, s.name, legendStyle)
+		chart.Draw.Text(r, s.name, lx+20, legendY+tb.Height()>>1, legendStyle)
+		lx += 20 + tb.Width() + 26
+	}
+
+	// y 轴量程取全序列最大值；记录全局峰值点供标注。
+	globalMax := 0
+	peakSi, peakBi := -1, -1
+	for si, s := range series {
+		for bi, b := range s.bkts {
+			if b.Count > globalMax {
+				globalMax, peakSi, peakBi = b.Count, si, bi
+			}
 		}
 	}
-	ticks := intTicks(maxCount)
+	ticks := intTicks(globalMax)
 	top := int(ticks[len(ticks)-1].Value) // y 轴量程上限（整数刻度末值）
 
 	plotLeft := trendPlotLeft
@@ -91,10 +141,7 @@ func renderTrendPanel(stats *query.Stats, kind string, loc *time.Location) (imag
 	plotTop, plotBottom := trendPlotTop, trendHeight-trendXReserve
 	plotH := plotBottom - plotTop
 
-	tickStyle, err := textStyle(axisFontSize+1, mutedText)
-	if err != nil {
-		return nil, err
-	}
+	tickStyle := legendStyle
 	gridLine := chart.Style{StrokeColor: gridDark, StrokeWidth: 1}
 
 	// 横向网格线与 y 轴刻度标签（0 刻度不画网格线，基线随后单独描亮）。
@@ -111,48 +158,55 @@ func renderTrendPanel(stats *query.Stats, kind string, loc *time.Location) (imag
 		chart.Draw.Text(r, t.Label, plotLeft-10-tb.Width(), y+tb.Height()>>1, tickStyle)
 	}
 
-	// 平色纵向柱：零计数不画（基线可见）；峰值柱用更亮色并在柱顶标数值。
-	n := len(buckets) // 24 或 7，恒非空
+	n := len(series[0].bkts) // 24 或 7，各序列等长
 	slot := (plotRight - plotLeft) / n
-	barW := slot - 10
-	if barW > trendMaxBarWidth {
-		barW = trendMaxBarWidth
+	pointY := func(si, bi int) (int, int) {
+		cx := plotLeft + slot*bi + slot/2
+		return cx, plotBottom - series[si].bkts[bi].Count*plotH/top
 	}
-	if barW < 2 {
-		barW = 2
+
+	// 折线与数据点标记（零点不标，避免贴基线堆点）。
+	for si, s := range series {
+		lineStyle := chart.Style{StrokeColor: s.color, StrokeWidth: 2}
+		lineStyle.WriteToRenderer(r)
+		for bi := range s.bkts {
+			cx, y := pointY(si, bi)
+			if bi == 0 {
+				r.MoveTo(cx, y)
+			} else {
+				r.LineTo(cx, y)
+			}
+		}
+		r.Stroke()
+		for bi, b := range s.bkts {
+			if b.Count <= 0 {
+				continue
+			}
+			cx, y := pointY(si, bi)
+			chart.Draw.Box(r, chart.Box{Left: cx - 1, Right: cx + 2, Top: y - 1, Bottom: y + 2},
+				chart.Style{FillColor: s.color})
+		}
 	}
+
+	// 全局峰值标注数值。
 	valueStyle, err := textStyle(axisFontSize+1, valueText)
 	if err != nil {
 		return nil, err
 	}
-	for i, b := range buckets {
-		if b.Count <= 0 {
-			continue
-		}
-		h := b.Count * plotH / top
-		if h < 1 {
-			h = 1
-		}
-		cx := plotLeft + slot*i + slot/2
-		box := chart.Box{Left: cx - barW/2, Right: cx + barW/2 - 1,
-			Top: plotBottom - h, Bottom: plotBottom - 1}
-		if b.Count == maxCount {
-			chart.Draw.Box(r, box, peakStyle)
-			label := strconv.Itoa(b.Count)
-			tb := chart.Draw.MeasureText(r, label, valueStyle)
-			chart.Draw.Text(r, label, cx-tb.Width()>>1, box.Top-8, valueStyle)
-		} else {
-			chart.Draw.Box(r, box, barStyle)
-		}
+	if peakSi >= 0 {
+		cx, y := pointY(peakSi, peakBi)
+		label := strconv.Itoa(globalMax)
+		tb := chart.Draw.MeasureText(r, label, valueStyle)
+		chart.Draw.Text(r, label, cx-tb.Width()>>1, y-8, valueStyle)
 	}
 
-	// x 轴基线 + 稀疏刻度与标签。
+	// x 轴基线 + 稀疏刻度与标签（标签取自首序列的补零桶，各序列一致）。
 	axisLine := chart.Style{StrokeColor: axisDark, StrokeWidth: 1}
 	axisLine.WriteToRenderer(r)
 	r.MoveTo(plotLeft, plotBottom)
 	r.LineTo(plotRight, plotBottom)
 	r.Stroke()
-	for i, b := range buckets {
+	for i, b := range series[0].bkts {
 		if i%labelEvery != 0 {
 			continue
 		}
@@ -167,17 +221,9 @@ func renderTrendPanel(stats *query.Stats, kind string, loc *time.Location) (imag
 	return imageFromRenderer(r, "趋势面板")
 }
 
-// trendBuckets 按图表类型取补零后的趋势桶、x 轴标签步长与面板标题单位。
-func trendBuckets(stats *query.Stats, kind string, loc *time.Location) (buckets []bucket, labelEvery int, unit string) {
-	if kind == KindDaily {
-		return hourlyBuckets(stats.Hourly, stats.Since, loc), trendLabelEvery, "hour"
-	}
-	return dailyBuckets(stats.Daily, stats.Since, loc), 1, "day"
-}
-
-// trendPanelTitle 生成趋势面板标题，如 "Connections per hour (UTC+8)"。
+// trendPanelTitle 生成趋势面板标题，如 "Activity per hour (UTC+8)"。
 func trendPanelTitle(unit string, loc *time.Location, ref time.Time) string {
-	return asciiSafe(fmt.Sprintf("Connections per %s (%s)", unit, utcOffsetSuffix(loc, ref)))
+	return asciiSafe(fmt.Sprintf("Activity per %s (%s)", unit, utcOffsetSuffix(loc, ref)))
 }
 
 // renderTopIPPanel 手绘 Top 来源 IP 横向条形图面板：取前 topIPMaxRows 个，
