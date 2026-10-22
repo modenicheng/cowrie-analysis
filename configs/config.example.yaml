@@ -23,6 +23,13 @@ app:
   state_dir: /var/lib/e3-security-analyst
   # 日志级别：debug | info | warn | error（JSON 结构化日志输出到 stdout/journald）。
   log_level: info
+  # 数据保留期（天）：e3-analyst daemon 启动时与每 24h 按服务侧入库时间
+  # （collected_at/updated_at 等，绝不使用攻击者可伪造的事件时间戳）分批清理
+  # 超过保留期的 events（含 raw 原文，磁盘大头）、sessions、parse_errors、
+  # collector_gaps 与已发送的 notifications——防止攻击者高频灌唯一事件
+  # 耗尽磁盘、威胁同机其他服务。待补发/待重试通知与报告/审计表不清理。
+  # 0 = 禁用清理（保持旧行为，不建议）。范围 [0, 3650]。
+  retention_days: 90
 
 cowrie:
   # Cowrie JSONL 日志路径。注意：不同 Cowrie 容器/安装方式的挂载路径不同，

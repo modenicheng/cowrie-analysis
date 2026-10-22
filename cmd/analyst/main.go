@@ -4,7 +4,9 @@
 //
 //	report --type daily|weekly   一次性生成报告（systemd timer 触发）
 //	daemon                       常驻：每 30s 补发 pending 通知 +
-//	                             每 10min 重试 72h 内 attempts<3 的失败报告
+//	                             每 10min 重试 72h 内 attempts<3 的失败报告 +
+//	                             启动时与每 24h 按保留期清理过期数据
+//	                             （app.retention_days=0 禁用）
 //	verify                       配置/环境自检（✓/✗ 清单，值绝不打印）
 //
 // 公共约定：--config <path>（默认 /etc/e3-security-analyst/config.yaml，
@@ -49,10 +51,11 @@ const configEnvVar = "E3_ANALYST_CONFIG"
 
 // daemon 循环节奏。
 const (
-	daemonFlushInterval = 30 * time.Second // 通知补发周期
-	daemonRetryInterval = 10 * time.Minute // 失败报告重试周期
-	daemonRetryWindow   = 72 * time.Hour   // 只重试该窗口内失败的报告
-	daemonMaxAttempts   = 3                // 重试的报告最大 attempts
+	daemonFlushInterval     = 30 * time.Second // 通知补发周期
+	daemonRetryInterval     = 10 * time.Minute // 失败报告重试周期
+	daemonRetryWindow       = 72 * time.Hour   // 只重试该窗口内失败的报告
+	daemonMaxAttempts       = 3                // 重试的报告最大 attempts
+	daemonRetentionInterval = 24 * time.Hour   // 数据保留清理周期（启动时另先跑一次）
 )
 
 func main() {
@@ -87,6 +90,7 @@ func usage(w io.Writer) {
 子命令：
   report --type daily|weekly [--config <path>]   生成日报/周报（oneshot）
   daemon [--config <path>]                       常驻：通知补发 + 失败报告重试
+                                                 + 数据保留清理（每 24h）
   verify [--config <path>]                       配置/环境自检
 
 公共参数：
@@ -306,6 +310,18 @@ func cmdDaemon(args []string) int {
 	retryTick := time.NewTicker(daemonRetryInterval)
 	defer retryTick.Stop()
 
+	// 数据保留清理：启用时启动先跑一次，此后每 24h 一次；
+	// app.retention_days=0 禁用（retentionC 为 nil channel，select 永不命中）。
+	var retentionC <-chan time.Time
+	if cfg.App.RetentionDays > 0 {
+		tick := time.NewTicker(daemonRetentionInterval)
+		defer tick.Stop()
+		retentionC = tick.C
+		env.retentionSweep(ctx, log)
+	} else {
+		log.Info("数据保留清理已禁用（app.retention_days=0）")
+	}
+
 	// 启动即补发一次积压通知。
 	if sent, failedPerm, ferr := env.publisher.FlushPending(ctx); ferr != nil {
 		log.Warn("补发通知失败", "error", ferr)
@@ -329,6 +345,8 @@ func cmdDaemon(args []string) int {
 			}
 		case <-retryTick.C:
 			env.retryFailedReports(ctx, log)
+		case <-retentionC:
+			env.retentionSweep(ctx, log)
 		}
 	}
 }
@@ -355,6 +373,33 @@ func (e *analystEnv) retryFailedReports(ctx context.Context, log *slog.Logger) {
 		if err := e.gen.Generate(ctx, r.Type); err != nil {
 			log.Warn("失败报告重试未成功", "type", r.Type, "error", err)
 		}
+	}
+}
+
+// retentionSweep 执行一次数据保留清理（安全审查 High#2：raw 原文无损入库，
+// 攻击者高频灌唯一事件可耗尽磁盘）。retention_days <= 0 时跳过；正常完成记
+// Info（各表删除行数），失败仅 Warn 不影响 daemon 的通知补发/报告重试职责，
+// 等待下一轮（24h）重试。
+func (e *analystEnv) retentionSweep(ctx context.Context, log *slog.Logger) {
+	if e.cfg.App.RetentionDays <= 0 {
+		return
+	}
+	stats, err := e.db.CleanupRetention(ctx, e.cfg.App.RetentionDays)
+	if err != nil {
+		log.Warn("数据保留清理失败", "error", err, "retention_days", e.cfg.App.RetentionDays)
+		return
+	}
+	if stats.CheckpointErr != "" {
+		log.Warn("保留清理后的 WAL checkpoint 失败（删除结果不受影响，下轮重试）",
+			"error", stats.CheckpointErr)
+	}
+	if stats.Events > 0 || stats.Sessions > 0 || stats.ParseErrors > 0 ||
+		stats.Gaps > 0 || stats.Notifications > 0 {
+		log.Info("数据保留清理完成",
+			"retention_days", e.cfg.App.RetentionDays,
+			"events", stats.Events, "sessions", stats.Sessions,
+			"parse_errors", stats.ParseErrors, "gaps", stats.Gaps,
+			"notifications", stats.Notifications)
 	}
 }
 

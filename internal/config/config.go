@@ -24,6 +24,11 @@ type Config struct {
 		Timezone string `yaml:"timezone"`
 		StateDir string `yaml:"state_dir"`
 		LogLevel string `yaml:"log_level"`
+		// RetentionDays 是数据保留期（天）：analyst daemon 启动时与每 24h
+		// 按服务侧入库时间清理超过保留期的 events（含 raw 原文）、sessions、
+		// parse_errors、collector_gaps 与已发送的 notifications，防止攻击者
+		// 高频灌唯一事件耗尽磁盘。0 = 禁用清理（保持旧行为）。
+		RetentionDays int `yaml:"retention_days"`
 	} `yaml:"app"`
 
 	Cowrie struct {
@@ -111,6 +116,7 @@ func Default() *Config {
 	c.App.Timezone = "Asia/Shanghai"
 	c.App.StateDir = "/var/lib/e3-security-analyst"
 	c.App.LogLevel = "info"
+	c.App.RetentionDays = 90
 
 	c.Cowrie.LogPath = "/var/log/cowrie/cowrie.json"
 	c.Cowrie.Follow = true
@@ -229,6 +235,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("app.state_dir 不能为空")
 	}
 	if _, err := logging.ParseLevel(c.App.LogLevel); err != nil {
+		return err
+	}
+	if err := inRange(c.App.RetentionDays, 0, 3650, "app.retention_days"); err != nil {
 		return err
 	}
 

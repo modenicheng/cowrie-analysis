@@ -1,5 +1,7 @@
 // Package store 提供 SQLite 持久化层：事件索引、会话聚合、采集游标、
-// 通知队列与报告/运行元数据。唯一写入方为 collector，analyst 通过 SQL() 只读。
+// 通知队列与报告/运行元数据。事件写入方为 collector；analyst 通过 SQL()
+// 执行只读查询，其 daemon 另经 CleanupRetention 做保留期清理（仅删除，
+// 不新增数据，见 retention.go）。
 //
 // 约定：时间列统一存储 UTC RFC3339Nano 文本（见 fmtTime/parseTime）；
 // 所有时间范围语义为 [Since, Until) 左闭右开。

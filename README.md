@@ -53,6 +53,7 @@ Cowrie JSONL 日志
 - **受限 JS 分析**：模型经 `execute_js` 提交的 Goja 脚本在独立子进程执行——空环境、无网络/文件/宿主对象、超时与输入输出限额、并发信号量；每次执行写入 `script_runs` 审计表。
 - **幂等采集**：按原始行 SHA-256 去重入库；以设备号/inode（Windows 为卷序号+文件索引）记录游标；处理追加写入、半行缓冲、运行中轮转（先抽干旧文件再切新文件）、启动补读 `log_path.*` 轮转残留、进程重启恢复，不丢不重。
 - **通知去重/限流/重试**：稳定去重键（`notifications.dedupe_key` 唯一约束），429/5xx/网络错误退避重试，失败持久化待 analyst daemon（每 30s FlushPending）补发，不确定结果用去重键防止重试造成重复。
+- **数据保留清理（防灌盘）**：analyst daemon 启动时与每 24h 按服务侧入库时间（`collected_at`/`updated_at` 等，**绝不使用攻击者可伪造的 `event_time`**）分批清理超过保留期的 `events`（含 `raw` 原文，磁盘大头）、`sessions`、`parse_errors`、`collector_gaps` 与已发送通知（`app.retention_days`，默认 90 天，`0`=禁用），删毕 `wal_checkpoint(TRUNCATE)` 回收 WAL 空间；待补发/待重试通知与报告/审计表不受影响——防攻击者高频灌唯一事件（sha256 去重对唯一内容无效）耗尽磁盘、威胁同机其他服务。
 - **可审计**：解析失败行隔离入 `parse_errors`；采集缺口入 `collector_gaps`；报告带 `content_sha256` 与 `analysis_runs` 全量记录（轮数、token、工具调用次数、错误）。
 
 ## 3. 快速开始（开发环境）
@@ -121,6 +122,7 @@ sqlite3 /tmp/e3smoke/events.db "SELECT file_key, offset, file_size FROM collecto
 | `app.timezone` | `Asia/Shanghai` | 展示时区（IANA 名）。内部时间统一 UTC 存储，展示时转换 |
 | `app.state_dir` | `/var/lib/e3-security-analyst` | 状态目录（数据库、报告归档）。**生产必须 0700、owner e3sec:e3sec** |
 | `app.log_level` | `info` | `debug/info/warn/error`，JSON 结构化日志输出到 stdout/journald |
+| `app.retention_days` | `90` | 数据保留期（天），范围 [0, 3650]，**`0`=禁用清理**（保持旧行为，不建议）：analyst daemon 启动时与每 24h 清理过期数据，**动机**：raw 原文无损入库且 sha256 去重对唯一内容无效，攻击者高频灌唯一事件可持续耗尽磁盘；**时间基准是服务侧入库时间**（`events.collected_at`、`sessions.updated_at`、`parse_errors.recorded_at`、`collector_gaps.collected_at`、已发送通知的 `sent_at`），绝不用攻击者可伪造的 `event_time`。清理范围：`events`（含 `raw`）、`sessions`、`parse_errors`、`collector_gaps`、已发送 `notifications`（pending/failed 绝不删）；报告/审计表与采集游标不清理 |
 
 ### cowrie
 
@@ -332,11 +334,11 @@ Cowrie 日志中的命令、用户名、密码、路径、文件名、消息文�
 | DeepSeek | `internal/llm/client_test.go` | JSON 模式单轮；多轮工具循环；非法 JSON 响应；429 退避重试（含 Retry-After）；5xx 重试后失败；401 不重试；请求超时；非法工具参数回传模型；工具轮数上限；响应字段缺失；无 API Key；代码栅栏剥离；Token 预算超限；上下文取消 |
 | ntfy | `internal/ntfy/client_test.go`、`publisher_test.go` | 正常发布；认证失败（不可重试）；429/5xx/超时（可重试）；正文超限/非法主题/非法优先级本地拒绝；匿名省略 Authorization；标题安全截断；入队去重与 Bump；TrySend 重试与耗尽；FlushPending 计数与摘要跳过 |
 | 规则告警 | `internal/rules/engine_test.go` | login.success 立即发送与会话去重；文件上传告警与去重；login.failed 聚合触发与递进；每会话首条命令（含重启后不重复）；connect 洪水汇总；全局限流与 digest 汇总 |
-| 存储与调度 | `internal/store/*_test.go`、`internal/scheduler/window_test.go` | Open/Migrate 幂等与顺序；插入去重（raw SHA-256）；会话跨批次聚合；游标/健康/缺口/解析错误往返；通知生命周期；报告 upsert/失败列表；analysis_runs、script_runs 往返；daily/weekly 窗口跨月跨年/周日/UTC/时区转换；PrevWindow |
+| 存储与调度 | `internal/store/*_test.go`、`internal/scheduler/window_test.go` | Open/Migrate 幂等与顺序；插入去重（raw SHA-256）；会话跨批次聚合；游标/健康/缺口/解析错误往返；通知生命周期；报告 upsert/失败列表；analysis_runs、script_runs 往返；**保留清理（各表判据/notifications 只删 sent/0=禁用/分批循环/幂等/0002 升级回填）**；daily/weekly 窗口跨月跨年/周日/UTC/时区转换；PrevWindow |
 | 工具调度 | `internal/tools/*_test.go` | query_events 默认窗口/字段剪裁/跨度校验/limit 钳制/字节预算；query_stats 透传与 TopN；execute_js 禁用态/成功审计/脚本错误/输入超限/超时钳制；submit_report 接受/类型不匹配/校验/拒绝/禁止键/未知字段容忍；Specs 合法与未知工具 |
 | 安全验收（阶段 G） | `internal/security/s1_injection_test.go`、`s2_credentials_test.go`、`s3_resources_test.go` | 提示词注入端到端：错型提交/编造 key_stats 被拒、注入内容仅是数据、submit_report 带 url/topic/token 键报错；凭据隔离：runner 子进程空环境（Key/Token 不可见）、密钥不进 LLM 请求体/日志/Redacted；资源耗尽组合复验：execute_js 超时/超大输入输出、query_events 跨度超限与 limit 钳制 |
 | 端到端集成 | `tests/e1_fullpipeline_test.go`、`e2_restart_recovery_test.go`、`e3_nollm_test.go`、`e4_cli_test.go` | 全链路（采集入库含坏行、字段保真、确定性统计、mock LLM 报告归档、实时告警先于报告、key_stats 与 SQL 一致）；重启幂等与通知恢复（pending 不丢、不重复）；无 LLM 凭据时采集与实时告警照常；e3-analyst verify 冒烟与 deploy unit → report 链路可达 |
-| CLI 与嵌入资产 | `cmd/collector/main_test.go`、`cmd/analyst/main_test.go`、`prompts/embed_test.go` | 示例配置逐字段可加载且通过校验（与 config schema 防漂移）；默认配置路径环境变量覆盖；verify 缺失凭据场景；内嵌提示词模板恰好 3 个 |
+| CLI 与嵌入资产 | `cmd/collector/main_test.go`、`cmd/analyst/main_test.go`、`prompts/embed_test.go` | 示例配置逐字段可加载且通过校验（与 config schema 防漂移）；默认配置路径环境变量覆盖；verify 缺失凭据场景；daemon 保留清理 sweep（0=禁用不动数据、>0 老删新留）；内嵌提示词模板恰好 3 个 |
 
 运行：
 
@@ -404,7 +406,7 @@ e3-security-analyst/
 │   ├── ntfy/                    # ntfy 客户端 + 持久化发布队列
 │   └── security/                # 安全验收测试（S1 提示词注入 / S2 凭据隔离 / S3 资源耗尽，SPEC 阶段 G）
 ├── prompts/                     # analyst.md（系统提示词）、daily-report.md、weekly-report.md（嵌入模板）
-├── migrations/                  # 0001_init.sql + embed.go（schema_migrations 版本化迁移）
+├── migrations/                  # 0001_init.sql、0002_retention.sql（保留清理列/索引）+ embed.go（schema_migrations 版本化迁移）
 ├── tests/                       # E1–E4 跨组件端到端集成测试（SPEC §16 验收映射）
 ├── deploy/                      # install.sh、6 个 systemd unit、env.example、README.md
 ├── configs/config.example.yaml
@@ -414,7 +416,7 @@ e3-security-analyst/
 └── README.md
 ```
 
-数据表（`migrations/0001_init.sql`）：`events`（含无损 `raw`）、`sessions`、`collector_offsets`、`collector_health`、`collector_gaps`、`parse_errors`、`notifications`、`reports`、`analysis_runs`、`script_runs`。
+数据表（`migrations/0001_init.sql`，0002 补 `collector_gaps.collected_at` 与保留清理索引）：`events`（含无损 `raw`）、`sessions`、`collector_offsets`、`collector_health`、`collector_gaps`、`parse_errors`、`notifications`、`reports`、`analysis_runs`、`script_runs`。
 
 ## 11. 边界与非目标
 

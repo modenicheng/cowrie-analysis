@@ -53,8 +53,8 @@ func TestOpenAndMigrateIdempotent(t *testing.T) {
 	if err := db.SQL().QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&versions); err != nil {
 		t.Fatalf("查询 schema_migrations 失败: %v", err)
 	}
-	if versions != 1 {
-		t.Fatalf("schema_migrations 记录数 = %d, 期望 1", versions)
+	if versions != 2 { // 0001_init + 0002_retention
+		t.Fatalf("schema_migrations 记录数 = %d, 期望 2", versions)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close 失败: %v", err)
@@ -85,10 +85,12 @@ func TestOpenAndMigrateIdempotent(t *testing.T) {
 
 // TestMigrateOrderingAndValidation：按版本号（而非字典序）应用、
 // 后续脚本可依赖前面的对象；缺少数字前缀的脚本报错。
+// 夹具版本号避开 1/2（已被 0001/0002 占用——Migrate 按版本号幂等跳过，
+// 撞号会导致脚本被静默跳过）。
 func TestMigrateOrderingAndValidation(t *testing.T) {
 	fsys := fstest.MapFS{
-		"10_b.sql": &fstest.MapFile{Data: []byte(`INSERT INTO mig_log VALUES('b');`)},
-		"2_a.sql":  &fstest.MapFile{Data: []byte(`CREATE TABLE mig_log (name TEXT); INSERT INTO mig_log VALUES('a');`)},
+		"20_b.sql": &fstest.MapFile{Data: []byte(`INSERT INTO mig_log VALUES('b');`)},
+		"3_a.sql":  &fstest.MapFile{Data: []byte(`CREATE TABLE mig_log (name TEXT); INSERT INTO mig_log VALUES('a');`)},
 	}
 	db := openTestDB(t)
 	if err := db.Migrate(fsys); err != nil {
@@ -98,8 +100,8 @@ func TestMigrateOrderingAndValidation(t *testing.T) {
 	if err := db.SQL().QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&applied); err != nil {
 		t.Fatalf("查询 schema_migrations 失败: %v", err)
 	}
-	if applied != 3 { // 0001 + 2 + 10
-		t.Fatalf("schema_migrations 记录数 = %d, 期望 3", applied)
+	if applied != 4 { // 0001 + 0002 + 3 + 20
+		t.Fatalf("schema_migrations 记录数 = %d, 期望 4", applied)
 	}
 	// 幂等：再执行一次不重复应用。
 	if err := db.Migrate(fsys); err != nil {

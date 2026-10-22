@@ -155,11 +155,14 @@ type Gap struct {
 	Reason     string
 }
 
-// AddGap 记录一个数据缺口 [start, end)。
+// AddGap 记录一个数据缺口 [start, end)。collected_at 为服务侧入库时间，
+// 由本方法统一填充 time.Now().UTC()（0002 起新增，是保留清理的判据；
+// gap_start/gap_end 是缺口边界，语义不同，不用作清理依据）。
 func (db *DB) AddGap(ctx context.Context, start, end time.Time, reason string) error {
 	if _, err := db.sql.ExecContext(ctx,
-		`INSERT INTO collector_gaps(gap_start, gap_end, reason) VALUES(?,?,?)`,
-		fmtTime(start), fmtTime(end), reason); err != nil {
+		`INSERT INTO collector_gaps(gap_start, gap_end, reason, collected_at)
+		VALUES(?,?,?,?)`,
+		fmtTime(start), fmtTime(end), reason, fmtTime(time.Now().UTC())); err != nil {
 		return fmt.Errorf("store.AddGap: %w", err)
 	}
 	return nil

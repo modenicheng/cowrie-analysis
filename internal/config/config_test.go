@@ -211,3 +211,73 @@ func TestRedactURL(t *testing.T) {
 		}
 	}
 }
+
+// app.retention_days：默认 90（启用清理），范围 [0, 3650]，0 合法（禁用），
+// 越界报错须含字段名与范围。
+func TestAppRetentionValidation(t *testing.T) {
+	if c := Default(); c.App.RetentionDays != 90 {
+		t.Errorf("默认 retention_days = %d, want 90", c.App.RetentionDays)
+	}
+	cases := []struct {
+		value    int
+		wantPass bool
+	}{
+		{-1, false}, {0, true}, {1, true}, {90, true}, {3650, true}, {3651, false},
+	}
+	for _, tc := range cases {
+		c := Default()
+		c.App.RetentionDays = tc.value
+		err := c.Validate()
+		if tc.wantPass {
+			if err != nil {
+				t.Errorf("retention_days=%d 应通过: %v", tc.value, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("retention_days=%d 应报错", tc.value)
+			continue
+		}
+		for _, sub := range []string{"app.retention_days", "0", "3650"} {
+			if !strings.Contains(err.Error(), sub) {
+				t.Errorf("retention_days=%d 报错应含 %q: %v", tc.value, sub, err)
+			}
+		}
+	}
+}
+
+// YAML 键 app.retention_days 可解码且覆盖默认值。
+func TestLoadRetentionKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+app:
+  timezone: Asia/Shanghai
+  state_dir: /tmp/e3
+  retention_days: 365
+cowrie:
+  log_path: /var/log/cowrie/cowrie.json
+database:
+  path: /tmp/e3/events.db
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("写临时配置: %v", err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.App.RetentionDays != 365 {
+		t.Errorf("retention_days = %d, want 365", c.App.RetentionDays)
+	}
+
+	// 越界值在 Load 阶段被拒绝且报错含字段名。
+	bad := filepath.Join(dir, "bad.yaml")
+	badYaml := strings.Replace(yaml, "retention_days: 365", "retention_days: 9999", 1)
+	if err := os.WriteFile(bad, []byte(badYaml), 0o600); err != nil {
+		t.Fatalf("写临时配置: %v", err)
+	}
+	if _, err := Load(bad); err == nil || !strings.Contains(err.Error(), "app.retention_days") {
+		t.Errorf("retention_days=9999 应在 Load 时报错且含字段名, got %v", err)
+	}
+}
