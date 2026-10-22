@@ -30,7 +30,7 @@ const (
 	// imgWidth 是合成 PNG 的宽度（像素），所有面板同宽后纵向拼接。
 	imgWidth = 1000
 	// headerHeight 是总标题条的高度。
-	headerHeight = 64
+	headerHeight = 72
 	// trendHeight 是趋势面板的高度。
 	trendHeight = 380
 	// topIPMaxRows 是 Top IP 面板最多展示的来源 IP 行数。
@@ -82,7 +82,7 @@ func (r *Renderer) Render(stats *query.Stats, kind string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// stackImages 将各面板按顺序纵向拼接为一张图像：底层是整幅深色渐变
+// stackImages 将各面板按顺序纵向拼接为一张图像：底层是整幅平色深色
 // 背景（theme.go），各面板透明底叠加其上；各面板宽度一致（由 imgWidth
 // 保证）。
 func stackImages(panels ...image.Image) *image.RGBA {
@@ -90,7 +90,8 @@ func stackImages(panels ...image.Image) *image.RGBA {
 	for _, p := range panels {
 		totalHeight += p.Bounds().Dy()
 	}
-	canvas := bgGradient(imgWidth, totalHeight)
+	canvas := image.NewRGBA(image.Rect(0, 0, imgWidth, totalHeight))
+	draw.Draw(canvas, canvas.Bounds(), image.NewUniform(bgFlat), image.Point{}, draw.Src)
 	y := 0
 	for _, p := range panels {
 		rect := image.Rect(0, y, imgWidth, y+p.Bounds().Dy())
