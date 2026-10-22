@@ -21,9 +21,10 @@ config.local.yaml
 *.env
 !deploy/env.example
 
-# 编辑器/系统
+# 编辑器/系统/工具
 .idea/
 .vscode/
+.zcode/
 *.swp
 .DS_Store
 Thumbs.db
