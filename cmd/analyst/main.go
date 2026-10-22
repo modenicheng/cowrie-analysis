@@ -183,9 +183,12 @@ func assemble(cfg *config.Config, requireKey bool, log *slog.Logger) (*analystEn
 		APIKey:          llmKey,
 		Timeout:         time.Duration(cfg.LLM.TimeoutSeconds) * time.Second,
 		MaxToolRounds:   cfg.LLM.MaxToolRounds,
+		HardToolRounds:  cfg.LLM.HardToolRounds,
 		MaxOutputTokens: cfg.LLM.MaxOutputTokens,
 		MaxTotalTokens:  cfg.LLM.MaxTotalTokens,
 		EnableTools:     cfg.LLM.EnableTools,
+		Thinking:        cfg.LLM.Thinking,
+		ReasoningEffort: cfg.LLM.ReasoningEffort,
 	})
 
 	// Runner：启用且二进制存在才装配，否则降级 nil（execute_js 不可用）。
