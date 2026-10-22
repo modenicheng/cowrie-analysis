@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 
 	"github.com/modenc/e3-security-analyst/internal/sandbox"
 )
@@ -29,6 +30,20 @@ const (
 	// maxResultBytes is the child-side backstop on the serialized script
 	// result; the parent Runner enforces its own Limits.MaxOutputBytes.
 	maxResultBytes = 4 << 20
+	// softMemoryLimit is a Go runtime soft limit for this process (security
+	// review High#1): goja's vm.Interrupt only takes effect between
+	// interpreter instructions, so a single uninterruptible builtin call
+	// (e.g. "A".repeat(1<<30) or new Array(1e9).fill(0)) can allocate without
+	// bound before the wall-clock timeout fires. A soft limit makes the GC
+	// collect ever harder as the heap approaches it instead of letting the
+	// process balloon unopposed. Two harder layers back it up: the parent
+	// kills the child after timeout+grace, and systemd MemoryMax=256M (see
+	// deploy/*.service) is the final OOM ceiling — 192MiB sits below it with
+	// headroom for the GC to work, and far above any legitimate task (9 MiB
+	// input, 4 MiB result, a few multiples of both in goja values). Not
+	// configurable: this child runs with an empty environment and reads no
+	// config (YAGNI).
+	softMemoryLimit = 192 << 20 // 192 MiB
 )
 
 type runError struct {
@@ -62,6 +77,9 @@ func emitBadInput(format string, args ...any) {
 }
 
 func main() {
+	// Install the soft memory limit before any task data is read so no
+	// script-driven allocation can precede it (security review High#1).
+	debug.SetMemoryLimit(softMemoryLimit)
 	os.Exit(run())
 }
 

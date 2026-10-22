@@ -76,7 +76,9 @@ systemctl list-timers 'e3-*'                # 两个 timer 的下次触发时间
   `/usr/local/bin/e3-script-runner`，**不继承任何环境变量**（含
   `DEEPSEEK_API_KEY`、`NTFY_TOKEN`）。
 - 子进程受超时（`script_runner.timeout_ms` + 2s 宽限后强杀）、输入/输出
-  字节限额与并发信号量约束；脚本错误以结构化 JSON 返回，不 panic 外泄。
+  字节限额、内存限额（进程内 192MiB Go 软限 `debug.SetMemoryLimit` +
+  unit 的 `MemoryMax=256M` cgroup 硬顶）与并发信号量约束；脚本错误以
+  结构化 JSON 返回，不 panic 外泄。
 - 脚本运行环境不提供 `readFile`/`exec`/`fetch`/`require` 等宿主接口，
   也不能自行发送 ntfy 或调用 DeepSeek（SPEC §7.3/§18）。
 - 如需更强隔离，可由管理员把 `/usr/local/bin/e3-script-runner` 包进
@@ -95,6 +97,11 @@ systemctl list-timers 'e3-*'                # 两个 timer 的下次触发时间
 `SystemCallArchitectures=native` / `SystemCallFilter=@system-service` /
 `CapabilityBoundingSet=`（空）；写权限仅限 `ReadWritePaths=/var/lib/e3-security-analyst`
 （collector 额外 `ReadOnlyPaths=/var/log/cowrie`）。
+
+三个会派生 script-runner 的 unit（`e3-analyst` / `e3-daily-report` /
+`e3-weekly-report`）另设 `MemoryMax=256M`：在子进程内 192MiB Go 软限之上作
+OOM 硬顶（>软限，给 GC 留余量），防止 execute_js 内存炸弹波及同机其他服务；
+daemon 由 `Restart=always`、oneshot 由 timer 下一周期重试自愈。
 
 ## 定时任务
 

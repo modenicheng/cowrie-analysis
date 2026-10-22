@@ -47,6 +47,12 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 CapabilityBoundingSet=
+# 内存硬顶（安全审查 High#1）：script-runner 子进程的单个内建调用（如
+# "A".repeat / Array.fill）打不断 vm.Interrupt，可能分配 GB 级内存。子进程内
+# 已设 192MiB Go 软限（debug.SetMemoryLimit），本 cgroup 硬顶 256M（>软限，
+# 给 GC 留余量）作最终兜底；OOM 击杀 cgroup 内最大进程（通常是子进程本身），
+# daemon 由 Restart=always 自愈，不波及同机其他服务。
+MemoryMax=256M
 
 # 状态目录可写（报告、通知补发状态）；script-runner 子进程继承同一沙箱，
 # 额外受"空环境 + 超时/输出限额"约束（internal/sandbox.Runner）。

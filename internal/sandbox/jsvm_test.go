@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dop251/goja"
 )
 
 func mustJSONString(t *testing.T, out []byte) string {
@@ -99,6 +101,112 @@ func TestRunCodeOutputTooLarge(t *testing.T) {
 	}
 	if out != nil {
 		t.Fatalf("expected nil out on error, got %d bytes", len(out))
+	}
+}
+
+// Test 4b: pre-marshal size gate (security review High#1). Results whose
+// estimated serialized size already exceeds 2x the limit are rejected by the
+// cheap walk, before Export() materializes a Go copy and json.Marshal
+// allocates the encoded bytes on top. The rejection message carries the
+// "estimated" marker to distinguish it from the exact post-marshal check.
+func TestRunCodePreMarshalSizeGate(t *testing.T) {
+	// 4b-1: a 3 MiB string against a 1 MiB limit; the gate fires at
+	// len+2 = ~3 MiB without marshal ever seeing the value.
+	out, errType, errMsg, _ := RunCode(`"A".repeat(3*(1<<20))`, nil, 5000, 1<<20)
+	if errType != "OutputTooLarge" {
+		t.Fatalf("expected OutputTooLarge, got %q (%q)", errType, errMsg)
+	}
+	if !strings.Contains(errMsg, "estimated") {
+		t.Fatalf("expected the pre-marshal estimate message, got %q", errMsg)
+	}
+	if out != nil {
+		t.Fatalf("expected nil out on error, got %d bytes", len(out))
+	}
+
+	// 4b-2: boundary control — a string that fits the limit exactly still
+	// passes both the gate and the exact check ((1<<20)-2 payload + 2 quotes).
+	out, errType, errMsg, _ = RunCode(`"B".repeat((1<<20)-2)`, nil, 5000, 1<<20)
+	if errType != "" {
+		t.Fatalf("expected success at the exact limit, got errType=%q errMsg=%q", errType, errMsg)
+	}
+	if int64(len(out)) != 1<<20 {
+		t.Fatalf("expected exactly %d bytes, got %d", 1<<20, len(out))
+	}
+
+	// 4b-3: sparse array sized by length alone — 5,000,000 holes would have
+	// exported as a 5M-element Go slice; the gate rejects on the length
+	// property before any element is touched (the script itself allocates
+	// almost nothing, so this also proves the walk is what rejected).
+	out, errType, errMsg, _ = RunCode(`new Array(5000000)`, nil, 5000, 1<<20)
+	if errType != "OutputTooLarge" {
+		t.Fatalf("expected OutputTooLarge for sparse array, got %q (%q)", errType, errMsg)
+	}
+	if !strings.Contains(errMsg, "estimated") {
+		t.Fatalf("expected the pre-marshal estimate message, got %q", errMsg)
+	}
+
+	// 4b-4: normal structured results are unaffected by the gate (keys are
+	// sorted by encoding/json, matching goja's map export).
+	out, errType, errMsg, _ = RunCode(`({rows: [1, 2, 3], label: "daily", nested: {ok: true}})`, nil, 2000, 1<<20)
+	if errType != "" {
+		t.Fatalf("expected success, got errType=%q errMsg=%q", errType, errMsg)
+	}
+	if want := `{"label":"daily","nested":{"ok":true},"rows":[1,2,3]}`; string(out) != want {
+		t.Fatalf("expected %s, got %s", want, out)
+	}
+}
+
+// The estimator's weights are exact minimum JSON encodings, so for structures
+// it enumerates the estimate must lower-bound the real encoding/json output
+// and stay within a small factor of it (never reject-by-overestimate).
+func TestEstimateJSONSizeLowerBoundsMarshal(t *testing.T) {
+	vm := goja.New()
+	v, err := vm.RunString(`({a: [1, 2.5, "hello", null, true], b: "", c: [{d: null}], n: 123456789})`)
+	if err != nil {
+		t.Fatalf("RunString: %v", err)
+	}
+	data, err := json.Marshal(v.Export())
+	if err != nil {
+		t.Fatalf("marshal reference: %v", err)
+	}
+	est, panicVal := estimateJSONSize(v, 1<<30)
+	if panicVal != nil {
+		t.Fatalf("estimator panicked: %v", panicVal)
+	}
+	if est < int64(len(data)) {
+		t.Fatalf("estimate %d must lower-bound the real encoding (%d bytes)", est, len(data))
+	}
+	if est > 2*int64(len(data)) {
+		t.Fatalf("estimate %d is too loose for enumerated structures (%d bytes real)", est, len(data))
+	}
+}
+
+// By-length sizing paths (Set/Map/typed arrays) never enumerate elements;
+// they must still reject when the entry count alone overflows the budget.
+func TestEstimateJSONSizeLengthPaths(t *testing.T) {
+	vm := goja.New()
+	for _, tc := range []struct {
+		code   string
+		budget int64
+		want   bool // true => estimate must reach the budget (rejection)
+	}{
+		{`new Uint8Array(1000000)`, 1 << 20, true},
+		{`new Uint8Array(1000)`, 1 << 20, false},
+		{`new Set([1,2,3])`, 1 << 20, false},
+		{`new Map([[1,2],[3,4]])`, 1 << 20, false},
+		{`new String("abc")`, 1 << 20, false},
+	} {
+		v, err := vm.RunString(tc.code)
+		if err != nil {
+			t.Fatalf("%s: RunString: %v", tc.code, err)
+		}
+		est, panicVal := estimateJSONSize(v, tc.budget)
+		if panicVal != nil {
+			t.Fatalf("%s: estimator panicked: %v", tc.code, panicVal)
+		}
+		if (est >= tc.budget) != tc.want {
+			t.Fatalf("%s: estimate %d, budget %d, want rejection=%v", tc.code, est, tc.budget, tc.want)
+		}
 	}
 }
 
@@ -243,6 +351,45 @@ func TestRunCodePromiseUnsupported(t *testing.T) {
 		if errType != "UnsupportedResult" {
 			t.Fatalf("code %q: expected UnsupportedResult, got %q (%q, out=%s)", code, errType, errMsg, out)
 		}
+	}
+}
+
+// Hostile results that attack the size walk itself: getters on the result
+// re-enter the interpreter during inspection. A spinning getter is stopped by
+// the still-armed timeout interrupt; a throwing getter becomes a structured
+// NotSerializable error instead of a panic escaping RunCode (which would
+// crash the runner process with exit code 3).
+func TestRunCodeHostileGettersDuringInspection(t *testing.T) {
+	// Spinning getter: the script itself finishes instantly; the estimator's
+	// Get() enters the loop and is interrupted at the deadline. (The getter
+	// must be enumerable or neither Keys() nor Export() would ever run it.)
+	start := time.Now()
+	out, errType, errMsg, _ := RunCode(
+		`var o = {}; Object.defineProperty(o, "x", {get: function(){ while (true) {} }, enumerable: true}); o`,
+		nil, 200, 1<<20)
+	elapsed := time.Since(start)
+	if errType != "TimeoutError" {
+		t.Fatalf("expected TimeoutError, got %q (%q)", errType, errMsg)
+	}
+	if !strings.Contains(errMsg, "inspecting the script result") {
+		t.Fatalf("expected the inspection-timeout message, got %q", errMsg)
+	}
+	if out != nil {
+		t.Fatalf("expected nil out on error, got %d bytes", len(out))
+	}
+	if elapsed >= 5*time.Second {
+		t.Fatalf("inspection guard too slow: %v", elapsed)
+	}
+
+	// Throwing getter: a structured error, not a process-killing panic.
+	_, errType, errMsg, _ = RunCode(
+		`var o = {}; Object.defineProperty(o, "x", {get: function(){ throw new Error("boom"); }, enumerable: true}); o`,
+		nil, 2000, 1<<20)
+	if errType != "NotSerializable" {
+		t.Fatalf("expected NotSerializable, got %q (%q)", errType, errMsg)
+	}
+	if !strings.Contains(errMsg, "inspecting it threw") {
+		t.Fatalf("expected the inspection-threw message, got %q", errMsg)
 	}
 }
 

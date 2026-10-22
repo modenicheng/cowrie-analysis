@@ -168,6 +168,59 @@ func TestRunnerInputTooLarge(t *testing.T) {
 	}
 }
 
+// Test 13: memory bombs (security review High#1). vm.Interrupt cannot break a
+// single uninterruptible builtin call ("A".repeat / Array.fill allocate before
+// any interpreter boundary), so the defense is layered: the child's soft
+// memory limit keeps the GC fighting back, and the pre-marshal size gate
+// rejects the giant result before Export()/json.Marshal amplify it. End to
+// end this must look like any other script error: child exits 0 and the
+// structured envelope names the failure — never a crash, never a Go-level
+// infrastructure error.
+func TestRunnerMemoryBombString(t *testing.T) {
+	r := testRunner()
+	start := time.Now()
+	res, err := r.Execute(context.Background(), `"A".repeat(256<<20)`, nil, 5000)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Execute: %v (bomb must be a structured script error, not an infrastructure failure)", err)
+	}
+	if res.OK {
+		t.Fatalf("expected structured failure, got OK with %d-byte result", len(res.Result))
+	}
+	if res.ErrorType != "OutputTooLarge" {
+		t.Fatalf("expected OutputTooLarge, got %q (%q)", res.ErrorType, res.ErrorMessage)
+	}
+	if elapsed >= 10*time.Second {
+		t.Fatalf("bomb handling too slow: %v (err=%q)", elapsed, res.ErrorMessage)
+	}
+	t.Logf("string bomb -> errType=%q errMsg=%q durationMS=%d elapsed=%v",
+		res.ErrorType, res.ErrorMessage, res.DurationMS, elapsed)
+}
+
+// Array-shaped bomb: fill() materializes millions of elements in the VM, then
+// the gate rejects by the length property alone — the 5M-element Go slice that
+// Export() would have built is never created.
+func TestRunnerMemoryBombArray(t *testing.T) {
+	r := testRunner()
+	start := time.Now()
+	res, err := r.Execute(context.Background(), `new Array(5000000).fill(0)`, nil, 5000)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Execute: %v (bomb must be a structured script error, not an infrastructure failure)", err)
+	}
+	if res.OK {
+		t.Fatalf("expected structured failure, got OK with %d-byte result", len(res.Result))
+	}
+	if res.ErrorType != "OutputTooLarge" {
+		t.Fatalf("expected OutputTooLarge, got %q (%q)", res.ErrorType, res.ErrorMessage)
+	}
+	if elapsed >= 10*time.Second {
+		t.Fatalf("bomb handling too slow: %v (err=%q)", elapsed, res.ErrorMessage)
+	}
+	t.Logf("array bomb -> errType=%q errMsg=%q durationMS=%d elapsed=%v",
+		res.ErrorType, res.ErrorMessage, res.DurationMS, elapsed)
+}
+
 // Blocking concurrency gate: concurrent executions all succeed and never
 // error out due to contention.
 func TestRunnerConcurrencyGate(t *testing.T) {
