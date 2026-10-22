@@ -103,10 +103,16 @@ func run() int {
 
 	var handler collector.EventHandler
 	var digestDone chan struct{} // 非 nil 表示 digest goroutine 在运行
+	var stopEngine func()        // 非 nil 表示告警引擎在运行（含其发送 goroutine）
 	if cfg.Alerts.Enabled {
 		engine := rules.New(cfg, db, publisher, log)
 		handler = engine
 		digestDone = make(chan struct{})
+		stopEngine = func() {
+			sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer scancel()
+			engine.Stop(sctx) // 取消在途 HTTP、排空发送队列；未送出通知保持 pending
+		}
 		go runDigestLoop(ctx, engine,
 			time.Duration(cfg.Alerts.DigestIntervalSec)*time.Second, log, digestDone)
 		log.Info("实时告警已启用", "digest_interval_seconds", cfg.Alerts.DigestIntervalSec,
@@ -119,6 +125,9 @@ func run() int {
 		if digestDone != nil {
 			stop() // 触发 ctx 取消
 			<-digestDone
+		}
+		if stopEngine != nil {
+			stopEngine() // 发送 goroutine 生命周期与进程退出衔接
 		}
 	}
 
