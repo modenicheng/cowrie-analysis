@@ -29,11 +29,11 @@ const (
 // come from application configuration; nothing is hardcoded.
 type ClientConfig struct {
 	BaseURL, Model, APIKey string
-	Timeout         time.Duration // per-request total timeout; <=0 => 120s
-	MaxToolRounds   int           // max rounds with tool execution; <=0 => 6
-	MaxOutputTokens int           // max_tokens per request; 0 => omit
-	MaxTotalTokens  int           // task-level cumulative budget; 0 => unlimited
-	EnableTools     bool          // false => single-shot json_object mode
+	Timeout                time.Duration // per-request total timeout; <=0 => 120s
+	MaxToolRounds          int           // max rounds with tool execution; <=0 => 6
+	MaxOutputTokens        int           // max_tokens per request; 0 => omit
+	MaxTotalTokens         int           // task-level cumulative budget; 0 => unlimited
+	EnableTools            bool          // false => single-shot json_object mode
 }
 
 // Client is a reusable chat completions client.
@@ -80,15 +80,15 @@ type ToolHandler func(ctx context.Context, call ToolCall) (resultJSON string, er
 // RunRequest is one analysis task.
 type RunRequest struct {
 	SystemPrompt, UserPrompt string
-	Tools    map[string]ToolSpec   // ignored when EnableTools is false
-	Handlers map[string]ToolHandler
-	FinalMaxBytes int // cap on the final model output; 0 => 64 KiB
+	Tools                    map[string]ToolSpec // ignored when EnableTools is false
+	Handlers                 map[string]ToolHandler
+	FinalMaxBytes            int // cap on the final model output; 0 => 64 KiB
 }
 
 // RunResult reports the final output and the accounting of a successful Run.
 type RunResult struct {
-	Content        []byte // final model output, fences stripped, raw JSON text
-	Rounds, ToolCalls int
+	Content                        []byte // final model output, fences stripped, raw JSON text
+	Rounds, ToolCalls              int
 	PromptTokens, CompletionTokens int
 }
 

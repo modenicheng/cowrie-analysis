@@ -6,6 +6,7 @@
 //   - 登录失败聚合的"计数里程碑"状态（lf）为内存 map；
 //   - 全局滑动 60s 发送窗口（sentTimes）为内存切片；
 //   - 限流合并的类型分布（digestKinds）为内存计数。
+//
 // 事件级去重（dedupe_key）与会话命令计数全部落在 SQLite 中，
 // 因此进程重启后不会重复告警（语义与重启前一致）。
 package rules
@@ -309,8 +310,8 @@ func (e *Engine) handleFirstCommand(ctx context.Context, ev *store.Event,
 	}
 	seenCmd[ev.Session] = true
 	cnt, err := e.db.CountEvents(ctx, store.EventFilter{
-		Session:   ev.Session,
-		EventIDs:  []string{cowrie.EventCommandInput},
+		Session:  ev.Session,
+		EventIDs: []string{cowrie.EventCommandInput},
 	})
 	if err != nil {
 		e.log.Error("rules: 统计会话命令数失败", "session", ev.Session, "err", err)

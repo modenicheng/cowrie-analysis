@@ -107,12 +107,12 @@ func stepTool(name, args string) mockStep { return mockStep{toolName: name, tool
 func stepFinal(content string) mockStep   { return mockStep{content: content} }
 
 type llmMock struct {
-	mu      sync.Mutex
-	steps   []mockStep
-	step    int
-	bodies  []string // 按序记录每个请求体（含 tool 结果消息）
-	auths   []string // 按序记录 Authorization 头
-	srv     *httptest.Server
+	mu     sync.Mutex
+	steps  []mockStep
+	step   int
+	bodies []string // 按序记录每个请求体（含 tool 结果消息）
+	auths  []string // 按序记录 Authorization 头
+	srv    *httptest.Server
 }
 
 func newLLMMock(t *testing.T) *llmMock {

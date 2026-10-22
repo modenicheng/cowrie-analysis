@@ -70,13 +70,13 @@ func toolCallResp(id, name, args string, prompt, completion int) chatResponse {
 
 func testClient(baseURL string, mutate func(*ClientConfig)) *Client {
 	cfg := ClientConfig{
-		BaseURL:       baseURL,
-		Model:         "deepseek-test",
-		APIKey:        "test-key",
-		Timeout:       5 * time.Second,
-		MaxToolRounds: 6,
+		BaseURL:         baseURL,
+		Model:           "deepseek-test",
+		APIKey:          "test-key",
+		Timeout:         5 * time.Second,
+		MaxToolRounds:   6,
 		MaxOutputTokens: 512,
-		EnableTools:   false,
+		EnableTools:     false,
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -574,11 +574,11 @@ func TestNoAPIKey(t *testing.T) {
 // 12. Fenced content is stripped; missing usage counts as zero tokens.
 func TestRunFencedContentNoUsage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	// No usage block at all.
-	fence := "```"
-	body := `{"choices":[{"message":{"role":"assistant","content":"` + fence + `json\n{\"summary\":\"daily\"}\n` + fence + `"},"finish_reason":"stop"}]}`
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, body)
+		// No usage block at all.
+		fence := "```"
+		body := `{"choices":[{"message":{"role":"assistant","content":"` + fence + `json\n{\"summary\":\"daily\"}\n` + fence + `"},"finish_reason":"stop"}]}`
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, body)
 	}))
 	defer srv.Close()
 

@@ -10,8 +10,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	_ "time/tzdata"
 	"time"
+	_ "time/tzdata"
 
 	"gopkg.in/yaml.v3"
 
@@ -35,9 +35,9 @@ type Config struct {
 	} `yaml:"cowrie"`
 
 	Database struct {
-		Path           string `yaml:"path"`
-		WAL            bool   `yaml:"wal"`
-		BusyTimeoutMs  int    `yaml:"busy_timeout_ms"`
+		Path          string `yaml:"path"`
+		WAL           bool   `yaml:"wal"`
+		BusyTimeoutMs int    `yaml:"busy_timeout_ms"`
 	} `yaml:"database"`
 
 	LLM struct {
@@ -74,28 +74,28 @@ type Config struct {
 	} `yaml:"ntfy"`
 
 	Alerts struct {
-		Enabled                 bool `yaml:"enabled"`
-		MaxPerMinute            int  `yaml:"max_per_minute"`
-		LoginFailedWindowSec    int  `yaml:"login_failed_window_seconds"`
-		LoginFailedThreshold    int  `yaml:"login_failed_threshold"`
-		LoginFailedRepeatEvery  int  `yaml:"login_failed_repeat_every"`
-		DigestIntervalSec       int  `yaml:"digest_interval_seconds"`
+		Enabled                bool `yaml:"enabled"`
+		MaxPerMinute           int  `yaml:"max_per_minute"`
+		LoginFailedWindowSec   int  `yaml:"login_failed_window_seconds"`
+		LoginFailedThreshold   int  `yaml:"login_failed_threshold"`
+		LoginFailedRepeatEvery int  `yaml:"login_failed_repeat_every"`
+		DigestIntervalSec      int  `yaml:"digest_interval_seconds"`
 	} `yaml:"alerts"`
 
 	Reports struct {
-		DailyEnabled    bool `yaml:"daily_enabled"`
-		WeeklyEnabled   bool `yaml:"weekly_enabled"`
-		IncludeSourceIPs bool `yaml:"include_source_ips"`
-		IncludePaths    bool `yaml:"include_paths"`
-		IncludeCommands bool `yaml:"include_commands"`
-		Dir             string `yaml:"dir"`
-		MaxQuerySpanDays int  `yaml:"max_query_span_days"`
+		DailyEnabled     bool   `yaml:"daily_enabled"`
+		WeeklyEnabled    bool   `yaml:"weekly_enabled"`
+		IncludeSourceIPs bool   `yaml:"include_source_ips"`
+		IncludePaths     bool   `yaml:"include_paths"`
+		IncludeCommands  bool   `yaml:"include_commands"`
+		Dir              string `yaml:"dir"`
+		MaxQuerySpanDays int    `yaml:"max_query_span_days"`
 	} `yaml:"reports"`
 }
 
 var (
-	topicRe    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	envNameRe  = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+	topicRe   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	envNameRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 )
 
 // Default 返回填好默认值的配置。

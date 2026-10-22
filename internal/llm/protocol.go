@@ -38,10 +38,10 @@ type toolCallMsg struct {
 // message is one entry of the request/response "messages" array, supporting
 // the system, user, assistant and tool roles.
 type message struct {
-	Role       string        `json:"role"`                      // system|user|assistant|tool
-	Content    string        `json:"content"`                   // tool results and text content
-	ToolCalls  []toolCallMsg `json:"tool_calls,omitempty"`      // assistant only
-	ToolCallID string        `json:"tool_call_id,omitempty"`    // tool role only
+	Role       string        `json:"role"`                   // system|user|assistant|tool
+	Content    string        `json:"content"`                // tool results and text content
+	ToolCalls  []toolCallMsg `json:"tool_calls,omitempty"`   // assistant only
+	ToolCallID string        `json:"tool_call_id,omitempty"` // tool role only
 }
 
 // chatRequest is the POST /chat/completions body.

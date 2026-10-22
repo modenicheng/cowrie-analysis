@@ -1,5 +1,5 @@
 // Command e3-collector 持续采集 Cowrie JSONL 日志并驱动确定性实时告警
-//（SPEC §2/§6/§10/§14；CONTRACTS "cmd 二进制"）。
+// （SPEC §2/§6/§10/§14；CONTRACTS "cmd 二进制"）。
 //
 // 启动流程：
 //

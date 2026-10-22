@@ -25,11 +25,11 @@ var retryBackoffBase = 1 * time.Second
 // fails fast.
 func retryableStatus(code int) bool {
 	switch code {
-	case http.StatusTooManyRequests,     // 429
-		http.StatusInternalServerError,  // 500
-		http.StatusBadGateway,           // 502
-		http.StatusServiceUnavailable,   // 503
-		http.StatusGatewayTimeout:       // 504
+	case http.StatusTooManyRequests, // 429
+		http.StatusInternalServerError, // 500
+		http.StatusBadGateway,          // 502
+		http.StatusServiceUnavailable,  // 503
+		http.StatusGatewayTimeout:      // 504
 		return true
 	}
 	return false

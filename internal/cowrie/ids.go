@@ -5,12 +5,12 @@ package cowrie
 
 // Cowrie 事件 ID 常量（以 Cowrie 主线为准，未知变体按前缀归类）。
 const (
-	EventConnect      = "cowrie.session.connect"
-	EventLoginFailed  = "cowrie.login.failed"
-	EventLoginSuccess = "cowrie.login.success"
-	EventCommandInput = "cowrie.command.input"
-	EventFileUpload   = "cowrie.session.file_upload"
-	EventFileDownload = "cowrie.session.file_download"
+	EventConnect       = "cowrie.session.connect"
+	EventLoginFailed   = "cowrie.login.failed"
+	EventLoginSuccess  = "cowrie.login.success"
+	EventCommandInput  = "cowrie.command.input"
+	EventFileUpload    = "cowrie.session.file_upload"
+	EventFileDownload  = "cowrie.session.file_download"
 	EventSessionClosed = "cowrie.session.closed"
 )
 
