@@ -1,7 +1,8 @@
 // Package llm implements a minimal OpenAI-compatible chat completions client
 // for DeepSeek using only the standard library: a tool-calling Run loop, JSON
 // output mode, retry with exponential backoff (honoring Retry-After), token
-// budget guards, and structured errors that work with errors.Is / errors.As.
+// budget soft stops, and structured errors that work with errors.Is /
+// errors.As.
 package llm
 
 import (
@@ -30,9 +31,12 @@ const (
 // 轮次追加的 system 提示（持续催促收尾，但不拒绝工具调用）。
 const softLimitHintTmpl = "系统提示：工具调用轮数已超出软上限（%d 轮）。请尽快基于已有信息输出最终报告并调用 submit_report；未能详细分析的部分必须如实写入 data_limitations 字段说明，不得省略。"
 
-// hardLimitFinalMsg 是到达硬上限（llm.hard_tool_rounds）触发强制收稿时，
-// 追加在对话末尾的 system 指令：无工具、直接输出最终报告 JSON。
-const hardLimitFinalMsg = "系统提示：工具调用轮数已达到硬上限，本次请求不提供任何工具。请立即基于对话中已有的信息，直接输出最终报告的 JSON（结构与 submit_report 参数一致）；因预算未能详细分析的部分，必须如实写入 data_limitations 字段说明，不得省略，也不要请求任何工具。"
+// hardLimitFinalMsg 是软停触发（工具轮数达硬上限，或累计 token 超出
+// MaxTotalTokens 预算）后强制收稿时，追加在对话末尾的 system 指令：
+// 无工具、只输出纯 JSON 的最终报告。请求同时携带 response_format
+// json_object（与 EnableTools=false 模式同款），指令里的「只能输出纯
+// JSON」措辞是 json_object 模式对提示词包含 JSON 字样要求的双保险。
+const hardLimitFinalMsg = "系统提示：工具轮数或 token 预算已达上限，本次请求不提供任何工具。请立即基于对话中已有的信息，直接输出最终报告的 JSON（结构与 submit_report 参数一致，且只能是纯 JSON，不要包含任何解释文字或 markdown 围栏）；因预算未能详细分析的部分，必须如实写入 data_limitations 字段说明，不得省略，也不要请求任何工具。"
 
 // ClientConfig configures a DeepSeek (OpenAI-compatible) client. All values
 // come from application configuration; nothing is hardcoded.
@@ -42,7 +46,7 @@ type ClientConfig struct {
 	MaxToolRounds          int           // 软上限：超过后每轮注入收尾提示；<=0 => 8
 	HardToolRounds         int           // 硬上限：到达后强制无工具收稿；<=0 => max(24, 软上限)
 	MaxOutputTokens        int           // max_tokens per request; 0 => omit
-	MaxTotalTokens         int           // task-level cumulative budget; 0 => unlimited
+	MaxTotalTokens         int           // task-level cumulative budget; soft stop (forces the toolless wrap-up when the model still requests tools); 0 => unlimited
 	EnableTools            bool          // false => single-shot json_object mode
 	// Thinking controls the DeepSeek thinking switch: ""/"auto" => 不发送该
 	// 字段（沿用服务端默认，思考模型默认开启）；"on" => thinking.type=
@@ -129,12 +133,18 @@ type RunResult struct {
 //     when the request carries tools).
 //  4. Soft limit (MaxToolRounds): once exceeded, every further round gets a
 //     system hint urging the model to wrap up — tool calls remain allowed.
-//  5. Hard limit (HardToolRounds): when the model still requests tools, one
-//     final toolless completion is issued with the full history preserved;
-//     its output returns through the normal final-content path. Only if that
-//     call itself fails does Run return ErrToolRoundsExceeded.
-//  6. The loop ends with a normal message whose content is fence-stripped and
-//     size-checked, or with ErrTokenBudgetExceeded.
+//  5. Soft stop (HardToolRounds / MaxTotalTokens): when the model still
+//     requests tools AND either the executed tool rounds reached the hard
+//     limit or the cumulative token accounting passed the budget, one final
+//     toolless completion is issued with the full history preserved (minus
+//     reasoning_content, plus response_format json_object); its output
+//     returns through the normal final-content path. Only if that call
+//     itself fails does Run return ErrToolRoundsExceeded.
+//  6. The loop ends with a normal message whose content is fence-stripped
+//     and size-checked. Token accounting is bookkeeping, never a failure:
+//     a legitimate final reply is returned even when it pushes the
+//     cumulative total past MaxTotalTokens — the budget exists to stop
+//     runaway tool loops, not to abort the last (or final) completion.
 func (c *Client) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 	var res RunResult
 	if c.cfg.APIKey == "" {
@@ -179,25 +189,20 @@ func (c *Client) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 	toolRounds := 0
 	for {
 		res.Rounds++
-		resp, err := c.postChat(ctx, msgs, toolDefs)
+		resp, err := c.postChat(ctx, msgs, toolDefs, false)
 		if err != nil {
 			return res, err
 		}
-
+		// 记账（永不失败）：token 累计只用于软停判定与结果上报。
 		res.PromptTokens += resp.Usage.PromptTokens
 		res.CompletionTokens += resp.Usage.CompletionTokens
-		if c.cfg.MaxTotalTokens > 0 &&
-			res.PromptTokens+res.CompletionTokens > c.cfg.MaxTotalTokens {
-			return res, fmt.Errorf("%w: %d tokens used, budget %d",
-				ErrTokenBudgetExceeded,
-				res.PromptTokens+res.CompletionTokens, c.cfg.MaxTotalTokens)
-		}
 
 		ch := resp.Choices[0]
 		if isToolRound(ch.FinishReason) && len(ch.Message.ToolCalls) > 0 {
-			if toolRounds >= c.cfg.HardToolRounds {
-				// 硬上限：强制收稿——一次不带 tools 的最终补全。
-				return c.finalWithoutTools(ctx, res, msgs, finalMax)
+			// 软停触发器：模型仍要工具 且（已执行工具轮数达硬上限 或
+			// 累计 token 超出预算）→ 强制无工具收稿。越限不 abort。
+			if reason, stop := c.softStop(toolRounds, res); stop {
+				return c.finalWithoutTools(ctx, res, msgs, finalMax, reason)
 			}
 			toolRounds++
 			msgs = append(msgs, message{
@@ -225,58 +230,88 @@ func (c *Client) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 			continue
 		}
 
-		content := stripCodeFence(ch.Message.Content)
-		if content == "" {
-			return res, fmt.Errorf("%w: empty final content (finish_reason=%q)",
-				ErrInvalidResponse, ch.FinishReason)
+		// 模型给出最终非工具回复：无论累计 token 是否越限，内容照常
+		// 返回（记账已完成；越限不是失败条件）。
+		if err := finalizeContent(&res, ch, finalMax, "final"); err != nil {
+			return res, err
 		}
-		if len(content) > finalMax {
-			return res, fmt.Errorf("%w: final content is %d bytes, limit %d",
-				ErrInvalidResponse, len(content), finalMax)
-		}
-		res.Content = []byte(content)
 		return res, nil
 	}
 }
 
-// finalWithoutTools 是硬上限触发的强制收稿：保留全部对话历史（system、
-// user、历次 assistant 工具轮与 tool 结果），追加一条无工具收尾的 system
-// 指令，发起一次不带 tools 的最终补全。成功则与正常最终输出走同一条
-// 路径（剥围栏、限长，写入 res.Content）——与 generator「无 submit_report
-// 被接受时把最终输出当草稿解析」的兜底天然兼容。仅当这次调用本身失败
-// （HTTP/超时/响应无效）才返回错误；ErrToolRoundsExceeded 只保留给该场景。
-func (c *Client) finalWithoutTools(ctx context.Context, res RunResult, msgs []message, finalMax int) (RunResult, error) {
+// softStop 判定软停触发器：模型仍在请求工具的前提下，已执行工具轮数
+// 达到硬上限（HardToolRounds），或累计 token 超出任务预算
+// （MaxTotalTokens，0 = 无限制）。预算与硬限一样只触发强制收稿，
+// 不构成任务失败。返回触发原因（供收稿失败的错误信息说明）。
+func (c *Client) softStop(toolRounds int, res RunResult) (reason string, stop bool) {
+	if toolRounds >= c.cfg.HardToolRounds {
+		return fmt.Sprintf("工具轮数已达硬上限 %d", c.cfg.HardToolRounds), true
+	}
+	if c.cfg.MaxTotalTokens > 0 &&
+		res.PromptTokens+res.CompletionTokens > c.cfg.MaxTotalTokens {
+		return fmt.Sprintf("累计 token %d 已超出预算 %d",
+			res.PromptTokens+res.CompletionTokens, c.cfg.MaxTotalTokens), true
+	}
+	return "", false
+}
+
+// finalizeContent 是最终模型输出的统一收尾：剥 markdown 围栏、非空与
+// 长度校验，通过后写入 res.Content。正常最终回复与强制收稿共用；
+// src 仅用于错误信息区分来源。
+func finalizeContent(res *RunResult, ch choice, finalMax int, src string) error {
+	content := stripCodeFence(ch.Message.Content)
+	if content == "" {
+		return fmt.Errorf("%w: %s: empty final content (finish_reason=%q)",
+			ErrInvalidResponse, src, ch.FinishReason)
+	}
+	if len(content) > finalMax {
+		return fmt.Errorf("%w: %s: final content is %d bytes, limit %d",
+			ErrInvalidResponse, src, len(content), finalMax)
+	}
+	res.Content = []byte(content)
+	return nil
+}
+
+// finalWithoutTools 是软停触发（工具轮数达硬上限，或累计 token 超出
+// MaxTotalTokens 预算）后的强制收稿：保留全部对话历史（system、user、
+// 历次 assistant 工具轮与 tool 结果），但剥离历史 assistant 消息的
+// reasoning_content——该字段仅在请求携带 tools 时被要求回传，无 tools
+// 请求携带它在旧 deepseek-reasoner 规则下曾是 400 条件，剥离在两代
+// 规则下都安全（带 tools 的主循环回传逻辑不受影响）。随后追加一条
+// 无工具收尾的 system 指令，并以 json_object 模式（与 EnableTools=false
+// 的单发模式同款）发起一次不带 tools 的最终补全，降低收稿回散文导致
+// 下游草稿严格解码失败的概率。
+//
+// 预算与轮数在此只记账不拦截：收稿调用的 token 消耗照常累入 res，
+// 但不做失败级预算检查——预算的目的是阻止失控工具循环，不是阻止
+// 最后一次收稿。成功则与正常最终输出走同一条内容收尾路径，与
+// generator「无 submit_report 被接受时把最终输出当草稿解析」的兜底
+// 天然兼容；仅当这次调用本身失败（HTTP/超时/响应无效）才返回错误
+// （包装 ErrToolRoundsExceeded，reason 说明是哪个软停触发器）。
+func (c *Client) finalWithoutTools(ctx context.Context, res RunResult, msgs []message, finalMax int, reason string) (RunResult, error) {
 	final := make([]message, 0, len(msgs)+1)
-	final = append(final, msgs...)
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			m.ReasoningContent = "" // 无 tools 收稿不回传思考内容（见上）
+		}
+		final = append(final, m)
+	}
 	final = append(final, message{Role: "system", Content: hardLimitFinalMsg})
 
-	resp, err := c.postChat(ctx, final, nil)
+	resp, err := c.postChat(ctx, final, nil, true)
 	if err != nil {
-		return res, fmt.Errorf("%w: 已达硬上限 %d 轮，最终补全调用失败: %w",
-			ErrToolRoundsExceeded, c.cfg.HardToolRounds, err)
+		return res, fmt.Errorf("%w: %s，最终补全调用失败: %w",
+			ErrToolRoundsExceeded, reason, err)
 	}
 
 	res.Rounds++
 	res.PromptTokens += resp.Usage.PromptTokens
 	res.CompletionTokens += resp.Usage.CompletionTokens
-	if c.cfg.MaxTotalTokens > 0 &&
-		res.PromptTokens+res.CompletionTokens > c.cfg.MaxTotalTokens {
-		return res, fmt.Errorf("%w: %d tokens used, budget %d",
-			ErrTokenBudgetExceeded,
-			res.PromptTokens+res.CompletionTokens, c.cfg.MaxTotalTokens)
-	}
 
 	ch := resp.Choices[0]
-	content := stripCodeFence(ch.Message.Content)
-	if content == "" {
-		return res, fmt.Errorf("%w: 硬上限收稿的最终输出为空 (finish_reason=%q)",
-			ErrInvalidResponse, ch.FinishReason)
+	if err := finalizeContent(&res, ch, finalMax, "forced wrap-up"); err != nil {
+		return res, err
 	}
-	if len(content) > finalMax {
-		return res, fmt.Errorf("%w: final content is %d bytes, limit %d",
-			ErrInvalidResponse, len(content), finalMax)
-	}
-	res.Content = []byte(content)
 	return res, nil
 }
 
@@ -329,14 +364,16 @@ func isToolRound(finishReason string) bool {
 // postChat performs one chat/completions request, retrying transient failures
 // (network errors, 429, 500, 502, 503, 504) with exponential backoff and
 // jitter, honoring a capped Retry-After header. It returns as soon as the
-// caller's context is done.
-func (c *Client) postChat(ctx context.Context, msgs []message, toolDefs []toolDefinition) (*chatResponse, error) {
+// caller's context is done. forceJSON selects the json_object response format
+// even when EnableTools is true — used only by the forced toolless wrap-up,
+// which wants the same strict-JSON behavior as the single-shot mode.
+func (c *Client) postChat(ctx context.Context, msgs []message, toolDefs []toolDefinition, forceJSON bool) (*chatResponse, error) {
 	toolChoice := any(nil)
 	if len(toolDefs) > 0 {
 		toolChoice = "auto"
 	}
 	var respFormat *responseFormat
-	if !c.cfg.EnableTools {
+	if !c.cfg.EnableTools || forceJSON {
 		respFormat = &responseFormat{Type: "json_object"}
 	}
 	// thinking：on → enabled，off → disabled；""/auto → 不发送（服务端

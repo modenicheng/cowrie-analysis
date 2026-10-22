@@ -502,10 +502,13 @@ func TestToolFailuresFeedErrorBack(t *testing.T) {
 
 // 9. 软/硬两档轮数控制：超出软上限后每个后续轮次注入收尾提示且工具仍
 // 可用；到达硬上限触发一次不带 tools 的最终补全，任务以可解析结果结束
-// 而非错误。
+// 而非错误。收稿请求体：无 tools、无 tool_choice、历史 assistant 的
+// reasoning_content 被剥离（主循环带 tools 的回传不受影响）、带
+// response_format json_object。
 func TestSoftHardToolRoundLimits(t *testing.T) {
 	var mu sync.Mutex
 	var reqs []chatRequest
+	var bodies []string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -515,12 +518,28 @@ func TestSoftHardToolRoundLimits(t *testing.T) {
 		}
 		mu.Lock()
 		reqs = append(reqs, req)
+		bodies = append(bodies, string(body))
 		n := len(reqs)
 		mu.Unlock()
-		// 带工具的请求一律继续要工具（模型固执到硬上限）；不带工具的
-		// 最终补全返回可被 generator 兜底解析的报告 JSON。
+		// 带工具的请求一律继续要工具（模型固执到硬上限），且附带
+		// reasoning_content 验证收稿剥离；不带工具的最终补全返回可被
+		// generator 兜底解析的报告 JSON。
 		if len(req.Tools) > 0 {
-			writeChat(t, w, toolCallResp(fmt.Sprintf("call_%d", n), "query_stats", `{}`, 1, 1))
+			writeChat(t, w, chatResponse{
+				Choices: []choice{{
+					Message: message{
+						Role:             "assistant",
+						ReasoningContent: fmt.Sprintf("reasoning round %d", n),
+						ToolCalls: []toolCallMsg{{
+							ID:       fmt.Sprintf("call_%d", n),
+							Type:     "function",
+							Function: functionCall{Name: "query_stats", Arguments: `{}`},
+						}},
+					},
+					FinishReason: "tool_calls",
+				}},
+				Usage: usageInfo{PromptTokens: 1, CompletionTokens: 1},
+			})
 			return
 		}
 		writeChat(t, w, finalResp(`{"type":"daily","summary":"degraded final"}`, "stop", 9, 9))
@@ -584,7 +603,15 @@ func TestSoftHardToolRoundLimits(t *testing.T) {
 		t.Errorf("soft-limit hint should mention data_limitations")
 	}
 
-	// 最终补全：不带 tools/tool_choice，保留全部对话历史，末尾追加硬限收稿指令。
+	// 主循环带 tools 时 reasoning_content 原样回传（第 2-5 个请求的历史
+	// assistant 消息携带），证明收稿剥离针对的是收稿请求而非全局。
+	for i := 1; i <= 4; i++ {
+		if !strings.Contains(bodies[i], "reasoning_content") {
+			t.Errorf("request %d (tools mode) must echo reasoning_content", i+1)
+		}
+	}
+
+	// 最终补全：不带 tools/tool_choice/reasoning_content，带 json_object。
 	finalReq := reqs[5]
 	if len(finalReq.Tools) != 0 {
 		t.Errorf("final completion must not carry tools, got %d", len(finalReq.Tools))
@@ -592,13 +619,19 @@ func TestSoftHardToolRoundLimits(t *testing.T) {
 	if tc, _ := finalReq.ToolChoice.(string); tc != "" {
 		t.Errorf("final completion must not carry tool_choice, got %q", tc)
 	}
+	if strings.Contains(bodies[5], "reasoning_content") {
+		t.Errorf("final completion must strip reasoning_content:\n%s", bodies[5])
+	}
+	if finalReq.ResponseFormat == nil || finalReq.ResponseFormat.Type != "json_object" {
+		t.Errorf("final completion must set response_format json_object, got %+v", finalReq.ResponseFormat)
+	}
 	// 历史：user + 4×(assistant+tool) + 2 条软限提示 + 1 条硬限指令 = 12。
 	if len(finalReq.Messages) != 12 {
 		t.Fatalf("final completion has %d messages, want 12: %+v", len(finalReq.Messages), finalReq.Messages)
 	}
 	last := finalReq.Messages[len(finalReq.Messages)-1]
-	if last.Role != "system" || !strings.Contains(last.Content, "硬上限") {
-		t.Errorf("last message of final completion = %+v, want hard-limit system instruction", last)
+	if last.Role != "system" || !strings.Contains(last.Content, "不提供任何工具") {
+		t.Errorf("last message of final completion = %+v, want toolless wrap-up system instruction", last)
 	}
 	// 历史里的 assistant 工具轮完整保留（4 条 tool_calls）。
 	asst := 0
@@ -872,17 +905,243 @@ func TestStripCodeFence(t *testing.T) {
 	}
 }
 
-// 13. Cumulative token budget exceeded.
-func TestTokenBudgetExceeded(t *testing.T) {
+// 13a. 预算软停：累计 token 推过 MaxTotalTokens 且模型仍要工具 → 不
+// abort、不报错，转而发起一次无 tools 的强制收稿，任务以内容结束。
+// 收稿请求体断言：无 tools、无 tool_choice、历史 reasoning_content 被
+// 剥离、带 response_format json_object；收稿 token 照常记账。
+func TestBudgetOverrunTriggersToollessWrapup(t *testing.T) {
+	var mu sync.Mutex
+	var reqs []chatRequest
+	var bodies []string
+	var withToolsReqs int
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeChat(t, w, finalResp(`{"summary":"ok"}`, "stop", 50, 20))
+		body, _ := io.ReadAll(r.Body)
+		var req chatRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		reqs = append(reqs, req)
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+		if len(req.Tools) > 0 {
+			mu.Lock()
+			withToolsReqs++
+			n := withToolsReqs
+			mu.Unlock()
+			// 第 1 轮 50 ≤ 预算，工具照常执行；第 2 轮累计 170 > 150
+			// 触发软停（模型仍要工具）。
+			usage := usageInfo{PromptTokens: 40, CompletionTokens: 10}
+			if n == 2 {
+				usage = usageInfo{PromptTokens: 80, CompletionTokens: 40}
+			}
+			writeChat(t, w, chatResponse{
+				Choices: []choice{{
+					Message: message{
+						Role:             "assistant",
+						ReasoningContent: "budget round reasoning",
+						ToolCalls: []toolCallMsg{{
+							ID:       fmt.Sprintf("call_b%d", n),
+							Type:     "function",
+							Function: functionCall{Name: "query_stats", Arguments: `{}`},
+						}},
+					},
+					FinishReason: "tool_calls",
+				}},
+				Usage: usage,
+			})
+			return
+		}
+		writeChat(t, w, finalResp(`{"type":"daily","summary":"budget wrap-up"}`, "stop", 10, 5))
 	}))
 	defer srv.Close()
 
-	c := testClient(srv.URL, func(cfg *ClientConfig) { cfg.MaxTotalTokens = 10 })
-	_, err := c.Run(context.Background(), RunRequest{UserPrompt: "hi"})
-	if !errors.Is(err, ErrTokenBudgetExceeded) {
-		t.Fatalf("err = %v, want ErrTokenBudgetExceeded", err)
+	c := testClient(srv.URL, func(cfg *ClientConfig) {
+		cfg.EnableTools = true
+		cfg.MaxTotalTokens = 150
+		cfg.MaxToolRounds = 4
+		cfg.HardToolRounds = 8 // 轮数未达硬限：纯预算触发
+	})
+	res, err := c.Run(context.Background(), RunRequest{
+		UserPrompt: "go",
+		Tools: map[string]ToolSpec{
+			"query_stats": {Name: "query_stats", Description: "stats"},
+		},
+		Handlers: map[string]ToolHandler{
+			"query_stats": func(ctx context.Context, call ToolCall) (string, error) {
+				return "{}", nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run（预算越限应软停收稿而非报错）: %v", err)
+	}
+	if string(res.Content) != `{"type":"daily","summary":"budget wrap-up"}` {
+		t.Errorf("Content = %q, want 收稿报告 JSON", res.Content)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reqs) != 3 { // 2 个带工具轮（第 2 个越限）+ 1 次无工具收稿
+		t.Fatalf("server saw %d requests, want 3", len(reqs))
+	}
+	if res.Rounds != 3 || res.ToolCalls != 1 {
+		t.Errorf("Rounds=%d ToolCalls=%d, want 3/1（软停在执行第 2 轮工具前触发）",
+			res.Rounds, res.ToolCalls)
+	}
+	// 收稿 token 照常记账（120+50 工具轮 + 10+5 收稿）。
+	if res.PromptTokens != 130 || res.CompletionTokens != 55 {
+		t.Errorf("tokens = %d/%d, want 130/55", res.PromptTokens, res.CompletionTokens)
+	}
+	// 第 2 个请求（仍带 tools）回传 reasoning_content；收稿请求剥离。
+	if !strings.Contains(bodies[1], "reasoning_content") {
+		t.Errorf("tools-mode request must echo reasoning_content")
+	}
+	finalReq := reqs[2]
+	if len(finalReq.Tools) != 0 {
+		t.Errorf("收稿请求不得携带 tools, got %d", len(finalReq.Tools))
+	}
+	if tc, _ := finalReq.ToolChoice.(string); tc != "" {
+		t.Errorf("收稿请求不得携带 tool_choice, got %q", tc)
+	}
+	if strings.Contains(bodies[2], "reasoning_content") {
+		t.Errorf("收稿请求不得携带 reasoning_content:\n%s", bodies[2])
+	}
+	if finalReq.ResponseFormat == nil || finalReq.ResponseFormat.Type != "json_object" {
+		t.Errorf("收稿请求应带 response_format json_object, got %+v", finalReq.ResponseFormat)
+	}
+	// 收稿历史保留已执行的 assistant 工具轮（剥离的只是思考内容）。
+	asst := 0
+	for _, m := range finalReq.Messages {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			asst++
+		}
+	}
+	if asst != 1 {
+		t.Errorf("收稿历史保留 %d 条 assistant 工具轮, want 1", asst)
+	}
+	last := finalReq.Messages[len(finalReq.Messages)-1]
+	if last.Role != "system" || !strings.Contains(last.Content, "不提供任何工具") {
+		t.Errorf("收稿末尾应为软停 system 指令, got %+v", last)
+	}
+}
+
+// 13b. 越限后的合法最终回复不丢弃：模型给出最终非工具回复时，即使该
+// 回复把累计 token 推过预算（或单发模式首回复即越限），内容照常返回，
+// token 照常记账，绝不因事后越限而失败。
+func TestBudgetOverrunFinalReplyStillReturned(t *testing.T) {
+	cases := []struct {
+		name    string
+		tools   bool
+		budget  int
+		script  func(n int, w http.ResponseWriter)
+		wantTok [2]int
+	}{
+		{
+			name:   "tools loop final reply over budget",
+			tools:  true,
+			budget: 150,
+			script: func(n int, w http.ResponseWriter) {
+				if n == 1 {
+					writeChat(t, w, toolCallResp("c1", "query_stats", `{}`, 60, 30)) // 90 ≤ 150
+					return
+				}
+				writeChat(t, w, finalResp(`{"final":true}`, "stop", 60, 30)) // 累计 180 > 150
+			},
+			wantTok: [2]int{120, 60},
+		},
+		{
+			name:   "json mode single reply over budget",
+			tools:  false,
+			budget: 10,
+			script: func(n int, w http.ResponseWriter) {
+				writeChat(t, w, finalResp(`{"summary":"ok"}`, "stop", 50, 20))
+			},
+			wantTok: [2]int{50, 20},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var n atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				tc.script(int(n.Add(1)), w)
+			}))
+			defer srv.Close()
+
+			c := testClient(srv.URL, func(cfg *ClientConfig) {
+				cfg.EnableTools = tc.tools
+				cfg.MaxTotalTokens = tc.budget
+			})
+			res, err := c.Run(context.Background(), RunRequest{
+				UserPrompt: "go",
+				Handlers: map[string]ToolHandler{
+					"query_stats": func(ctx context.Context, call ToolCall) (string, error) {
+						return "{}", nil
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Run（越限后的最终回复必须返回内容而非报错）: %v", err)
+			}
+			if want := `{"final":true}`; tc.tools && string(res.Content) != want {
+				t.Errorf("Content = %q, want %q", res.Content, want)
+			}
+			if want := `{"summary":"ok"}`; !tc.tools && string(res.Content) != want {
+				t.Errorf("Content = %q, want %q", res.Content, want)
+			}
+			if res.PromptTokens != tc.wantTok[0] || res.CompletionTokens != tc.wantTok[1] {
+				t.Errorf("tokens = %d/%d, want %d/%d (照常记账)",
+					res.PromptTokens, res.CompletionTokens, tc.wantTok[0], tc.wantTok[1])
+			}
+		})
+	}
+}
+
+// 13c. 预算触发的收稿调用本身失败（HTTP 500 重试耗尽）→ 错误匹配
+// ErrToolRoundsExceeded 与 *HTTPStatusError，且错误信息说明预算触发。
+func TestBudgetWrapupCallFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req chatRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if len(req.Tools) > 0 {
+			writeChat(t, w, toolCallResp("c1", "query_stats", `{}`, 200, 100)) // 300 > 预算 150
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "wrap-up boom")
+	}))
+	defer srv.Close()
+
+	c := testClient(srv.URL, func(cfg *ClientConfig) {
+		cfg.EnableTools = true
+		cfg.MaxTotalTokens = 150
+		cfg.MaxToolRounds = 4
+		cfg.HardToolRounds = 8
+	})
+	_, err := c.Run(context.Background(), RunRequest{
+		UserPrompt: "go",
+		Tools: map[string]ToolSpec{
+			"query_stats": {Name: "query_stats", Description: "stats"},
+		},
+		Handlers: map[string]ToolHandler{
+			"query_stats": func(ctx context.Context, call ToolCall) (string, error) {
+				return "{}", nil
+			},
+		},
+	})
+	if !errors.Is(err, ErrToolRoundsExceeded) {
+		t.Fatalf("err = %v, want ErrToolRoundsExceeded", err)
+	}
+	var se *HTTPStatusError
+	if !errors.As(err, &se) || se.Code != http.StatusInternalServerError {
+		t.Errorf("err = %v, want wrapped *HTTPStatusError{500}", err)
+	}
+	if !strings.Contains(err.Error(), "预算") {
+		t.Errorf("error should name the budget trigger: %v", err)
 	}
 }
 
