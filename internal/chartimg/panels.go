@@ -1,6 +1,8 @@
-// 本文件实现三个面板的绘制：顶部总标题条、趋势柱状图面板（go-chart
-// BarChart，y 轴整数刻度）、Top 来源 IP 横向条形图面板（go-chart 的
-// BarChart 不支持绝对值横向条形图，故基于其 PNG 渲染器手绘）。
+// 本文件实现三个面板的绘制：顶部总标题条、趋势柱状图面板、Top 来源 IP
+// 横向条形图面板。两个数据面板均基于 go-chart 的 PNG 渲染器手绘——
+// 其 BarChart 会把 x 轴标签空间钳制在 DefaultVerticalTickHeight（约 5px），
+// 容纳不了日期时间标签，且横向条形图不支持绝对值比较，故统一自绘。
+// 视觉为深色科技风（theme.go）：卡片式面板、渐变霓虹柱、弱化网格线。
 // 各面板经 ImageWriter 直接取回 RGBA 图像，最终由 chartimg.go 纵向拼接。
 package chartimg
 
@@ -17,106 +19,152 @@ import (
 
 // 面板绘制常量（像素）。
 const (
-	headerFontSize     = 20  // 总标题字号
-	panelTitleFontSize = 15  // 面板标题字号
-	axisFontSize       = 9   // 坐标轴字号
-	trendLabelEvery    = 3   // daily 每 3 个小时桶标注一次 x 轴标签
-	trendHMargin       = 220 // 趋势面板预留给 y 轴与边距的水平空间
-	trendBarSpacing    = 6
-	trendMinBarWidth   = 4
+	headerFontSize     = 20 // 总标题字号
+	panelTitleFontSize = 15 // 面板标题字号
+	axisFontSize       = 9  // 坐标轴字号
+	trendLabelEvery    = 3  // daily 每 3 个小时桶标注一次 x 轴标签
 
-	topIPBaseHeight  = 150            // Top IP 面板固定高度（标题 + 数值轴 + 留白）
+	cardHInset = 12 // 面板卡片左右外边距
+	cardVInset = 6  // 面板卡片上下外边距
+
+	trendPlotLeft     = 76 // 趋势面板绘图区左界（卡片内留 y 轴刻度文本）
+	trendHMarginRight = 36 // 绘图区右界内边距
+	trendPlotTop      = 56 // 绘图区顶界（面板标题之下）
+	trendXReserve     = 54 // 底部为 x 轴刻度与标签预留的高度
+	trendMaxBarWidth  = 64 // 单柱最大宽度（weekly 仅 7 柱时防止过宽）
+
+	topIPBaseHeight  = 166            // Top IP 面板固定高度（卡片 + 标题 + 数值轴 + 留白）
 	topIPRowHeight   = 28             // 每个 IP 行高
 	topIPBarHeight   = 16             // 条形高度
-	topIPTitleY      = 26             // 标题中心 y
-	topIPPlotTop     = 60             // 首行条形中心 y
+	topIPTitleY      = 30             // 标题中心 y
+	topIPPlotTop     = 66             // 首行条形中心 y
 	topIPLabelRight  = 170            // IP 标签右边界（即条形起点）
 	topIPPlotRight   = imgWidth - 110 // 条形区右边界（右侧留数值文本）
-	topIPAxisBottomY = 52             // 底部数值轴距面板底边的高度
+	topIPAxisBottomY = 56             // 底部数值轴距面板底边的高度
 )
 
-// 面板配色。
-var (
-	barFill  = drawing.Color{R: 70, G: 130, B: 180, A: 255}  // 条形填充（钢蓝）
-	barEdge  = drawing.Color{R: 45, G: 90, B: 135, A: 255}   // 条形描边
-	textGray = drawing.Color{R: 110, G: 110, B: 110, A: 255} // 次要文本
-	// trendBarStyle 是趋势柱状图统一的条形样式（不设置则每个柱子
-	// 按序号取调色板颜色，呈彩虹色）。
-	trendBarStyle = chart.Style{FillColor: barFill, StrokeColor: barEdge, StrokeWidth: 1}
-	// topIPBarStyle 是 Top IP 条形样式。
-	topIPBarStyle = chart.Style{FillColor: barFill, StrokeColor: barEdge, StrokeWidth: 1}
-)
-
-// renderHeader 渲染总标题条：透明画布上一行居中黑字，白底由拼接层提供。
+// renderHeader 渲染总标题条：透明画布上居中白色总标题 + 底部青紫渐变
+// 强调线（背景由拼接层的整幅渐变提供）。
 func renderHeader(title string) (image.Image, error) {
 	r, err := chart.PNG(imgWidth, headerHeight)
 	if err != nil {
 		return nil, fmt.Errorf("chartimg: 创建标题画布失败: %w", err)
 	}
 	r.SetDPI(chart.DefaultDPI)
-	if err := drawCenteredText(r, title, imgWidth/2, headerHeight/2, headerFontSize, drawing.ColorBlack); err != nil {
+	if err := drawCenteredText(r, title, imgWidth/2, headerHeight/2-8,
+		headerFontSize, titleText); err != nil {
 		return nil, err
 	}
+	fillHGrad(r, chart.Box{Left: imgWidth/2 - 36, Right: imgWidth/2 + 36,
+		Top: headerHeight - 18, Bottom: headerHeight - 15}, accent, rank1GradA)
 	return imageFromRenderer(r, "标题条")
 }
 
-// renderTrendPanel 渲染趋势面板：daily 用 Hourly 补零后的 24 个小时桶，
-// weekly 用 Daily 补零后的 7 个日桶；y 轴整数刻度，x 轴标签稀疏。
+// renderTrendPanel 手绘趋势面板：daily 用 Hourly 补零后的 24 个小时桶，
+// weekly 用 Daily 补零后的 7 个日桶。左侧 y 轴整数刻度 + 弱化横向网格线，
+// 渐变纵向柱（峰值柱高亮并在柱顶标数值），底部 x 轴基线与稀疏刻度标签。
 func renderTrendPanel(stats *query.Stats, kind string, loc *time.Location) (image.Image, error) {
 	buckets, labelEvery, unit := trendBuckets(stats, kind, loc)
 
+	r, err := chart.PNG(imgWidth, trendHeight)
+	if err != nil {
+		return nil, fmt.Errorf("chartimg: 创建趋势画布失败: %w", err)
+	}
+	r.SetDPI(chart.DefaultDPI)
+	drawCard(r, chart.Box{Left: cardHInset, Top: cardVInset,
+		Right: imgWidth - cardHInset, Bottom: trendHeight - cardVInset})
+	if err := drawTitle(r, trendPanelTitle(unit, loc, stats.Since), cardHInset, topIPTitleY); err != nil {
+		return nil, err
+	}
+
 	maxCount := 0
-	bars := make([]chart.Value, len(buckets))
-	for i, b := range buckets {
+	for _, b := range buckets {
 		if b.Count > maxCount {
 			maxCount = b.Count
 		}
-		label := ""
-		if i%labelEvery == 0 {
-			label = asciiSafe(b.Label)
-		}
-		bars[i] = chart.Value{Value: float64(b.Count), Label: label, Style: trendBarStyle}
 	}
+	ticks := intTicks(maxCount)
+	top := int(ticks[len(ticks)-1].Value) // y 轴量程上限（整数刻度末值）
 
-	n := len(buckets) // 24 或 7，恒非空
-	barWidth := (imgWidth-trendHMargin)/n - trendBarSpacing
-	if barWidth < trendMinBarWidth {
-		barWidth = trendMinBarWidth
-	}
+	plotLeft := trendPlotLeft
+	plotRight := imgWidth - trendHMarginRight
+	plotTop, plotBottom := trendPlotTop, trendHeight-trendXReserve
+	plotH := plotBottom - plotTop
 
-	bc := chart.BarChart{
-		Title:      trendPanelTitle(unit, loc, stats.Since),
-		TitleStyle: chart.Style{FontSize: panelTitleFontSize},
-		Background: chart.Style{
-			FillColor: drawing.ColorWhite,
-			// v2.1.2 的 BarChart 最多为 x 轴标签预留 DefaultVerticalTickHeight，
-			// 折行后的标签会被裁掉，这里通过底部内边距显式预留标签空间。
-			Padding: chart.Box{Top: 8, Left: 20, Right: 20, Bottom: 84},
-		},
-		Width:      imgWidth,
-		Height:     trendHeight,
-		Bars:       bars,
-		BarWidth:   barWidth,
-		BarSpacing: trendBarSpacing,
-		XAxis:      chart.Style{FontSize: axisFontSize},
-		YAxis: chart.YAxis{
-			// 该版本 BarChart 的主 y 轴画在右侧；改用 secondary 使刻度
-			// 落在左侧（常规布局）。
-			AxisType: chart.YAxisSecondary,
-			Style:    chart.Style{FontSize: axisFontSize},
-			// 显式整数刻度同时决定了 y 轴量程，使全零数据也能渲染。
-			Ticks: intTicks(maxCount),
-		},
-	}
-	iw := chart.ImageWriter{}
-	if err := bc.Render(chart.PNG, &iw); err != nil {
-		return nil, fmt.Errorf("chartimg: 趋势面板渲染失败: %w", err)
-	}
-	img, err := iw.Image()
+	tickStyle, err := textStyle(axisFontSize+1, mutedText)
 	if err != nil {
-		return nil, fmt.Errorf("chartimg: 趋势面板输出图像失败: %w", err)
+		return nil, err
 	}
-	return img, nil
+	gridLine := chart.Style{StrokeColor: gridDark, StrokeWidth: 1}
+
+	// 横向网格线与 y 轴刻度标签（0 刻度不画网格线，基线随后单独描亮）。
+	for _, t := range ticks {
+		v := int(t.Value)
+		y := plotBottom - v*plotH/top
+		if v > 0 {
+			gridLine.WriteToRenderer(r)
+			r.MoveTo(plotLeft, y)
+			r.LineTo(plotRight, y)
+			r.Stroke()
+		}
+		tb := chart.Draw.MeasureText(r, t.Label, tickStyle)
+		chart.Draw.Text(r, t.Label, plotLeft-8-tb.Width(), y+tb.Height()>>1, tickStyle)
+	}
+
+	// 渐变纵向柱：零计数不画（基线可见）；峰值柱用更亮渐变并在柱顶标数值。
+	n := len(buckets) // 24 或 7，恒非空
+	slot := (plotRight - plotLeft) / n
+	barW := slot - 8
+	if barW > trendMaxBarWidth {
+		barW = trendMaxBarWidth
+	}
+	if barW < 2 {
+		barW = 2
+	}
+	valueStyle, err := textStyle(axisFontSize+1, valueText)
+	if err != nil {
+		return nil, err
+	}
+	for i, b := range buckets {
+		if b.Count <= 0 {
+			continue
+		}
+		h := b.Count * plotH / top
+		if h < 1 {
+			h = 1
+		}
+		cx := plotLeft + slot*i + slot/2
+		box := chart.Box{Left: cx - barW/2, Right: cx + barW/2 - 1,
+			Top: plotBottom - h, Bottom: plotBottom - 1}
+		if b.Count == maxCount {
+			fillVGrad(r, box, peakGradTop, peakGradBot)
+			label := strconv.Itoa(b.Count)
+			tb := chart.Draw.MeasureText(r, label, valueStyle)
+			chart.Draw.Text(r, label, cx-tb.Width()>>1, box.Top-8, valueStyle)
+		} else {
+			fillVGrad(r, box, barGradTop, barGradBot)
+		}
+	}
+
+	// x 轴基线 + 稀疏刻度与标签。
+	axisLine := chart.Style{StrokeColor: axisDark, StrokeWidth: 1}
+	axisLine.WriteToRenderer(r)
+	r.MoveTo(plotLeft, plotBottom)
+	r.LineTo(plotRight, plotBottom)
+	r.Stroke()
+	for i, b := range buckets {
+		if i%labelEvery != 0 {
+			continue
+		}
+		cx := plotLeft + slot*i + slot/2
+		axisLine.WriteToRenderer(r)
+		r.MoveTo(cx, plotBottom)
+		r.LineTo(cx, plotBottom+4)
+		r.Stroke()
+		tb := chart.Draw.MeasureText(r, b.Label, tickStyle)
+		chart.Draw.Text(r, b.Label, cx-tb.Width()>>1, plotBottom+8+tb.Height(), tickStyle)
+	}
+	return imageFromRenderer(r, "趋势面板")
 }
 
 // trendBuckets 按图表类型取补零后的趋势桶、x 轴标签步长与面板标题单位。
@@ -132,8 +180,9 @@ func trendPanelTitle(unit string, loc *time.Location, ref time.Time) string {
 	return asciiSafe(fmt.Sprintf("Connections per %s (%s)", unit, utcOffsetSuffix(loc, ref)))
 }
 
-// renderTopIPPanel 渲染 Top 来源 IP 横向条形图面板：取前 topIPMaxRows 个，
-// 值为 Connections、标签为 IP 字符串；无数据时渲染占位文案。
+// renderTopIPPanel 手绘 Top 来源 IP 横向条形图面板：取前 topIPMaxRows 个，
+// 值为 Connections、标签为 IP 字符串；榜首用亮紫渐变高亮，其余青色渐变；
+// 无数据时渲染占位文案。
 func renderTopIPPanel(tops []query.SrcIPStat) (image.Image, error) {
 	rows := tops
 	if len(rows) > topIPMaxRows {
@@ -145,14 +194,15 @@ func renderTopIPPanel(tops []query.SrcIPStat) (image.Image, error) {
 		return nil, fmt.Errorf("chartimg: 创建 Top IP 画布失败: %w", err)
 	}
 	r.SetDPI(chart.DefaultDPI)
-
-	if err := drawCenteredText(r, "Top source IPs by connections",
-		imgWidth/2, topIPTitleY, panelTitleFontSize, drawing.ColorBlack); err != nil {
+	drawCard(r, chart.Box{Left: cardHInset, Top: cardVInset,
+		Right: imgWidth - cardHInset, Bottom: height - cardVInset})
+	if err := drawTitle(r, "Top source IPs by connections", cardHInset, topIPTitleY); err != nil {
 		return nil, err
 	}
+
 	if len(rows) == 0 {
 		if err := drawCenteredText(r, "no source IPs in window",
-			imgWidth/2, topIPBaseHeight/2+10, 13, textGray); err != nil {
+			imgWidth/2, topIPBaseHeight/2+10, 13, mutedText); err != nil {
 			return nil, err
 		}
 		return imageFromRenderer(r, "Top IP 面板")
@@ -168,19 +218,19 @@ func renderTopIPPanel(tops []query.SrcIPStat) (image.Image, error) {
 		maxConn = 1 // 全零时避免除零
 	}
 
-	ipStyle, err := textStyle(11, drawing.ColorBlack)
+	ipStyle, err := textStyle(11, brightText)
 	if err != nil {
 		return nil, err
 	}
-	valueStyle, err := textStyle(11, textGray)
+	valueStyle, err := textStyle(11, valueText)
 	if err != nil {
 		return nil, err
 	}
-	tickStyle, err := textStyle(axisFontSize+1, textGray)
+	tickStyle, err := textStyle(axisFontSize+1, mutedText)
 	if err != nil {
 		return nil, err
 	}
-	lineStyle := chart.Style{StrokeColor: textGray, StrokeWidth: 1}
+	axisLine := chart.Style{StrokeColor: axisDark, StrokeWidth: 1}
 
 	plotWidth := topIPPlotRight - topIPLabelRight
 	for i, s := range rows {
@@ -190,12 +240,17 @@ func renderTopIPPanel(tops []query.SrcIPStat) (image.Image, error) {
 		chart.Draw.Text(r, ip, topIPLabelRight-10-tb.Width(), cy+tb.Height()>>1, ipStyle)
 
 		if w := plotWidth * s.Connections / maxConn; w > 0 {
-			chart.Draw.Box(r, chart.Box{
+			box := chart.Box{
 				Top:    cy - topIPBarHeight/2,
 				Left:   topIPLabelRight,
 				Right:  topIPLabelRight + w,
 				Bottom: cy + topIPBarHeight/2 - 1,
-			}, topIPBarStyle)
+			}
+			if i == 0 {
+				fillHGrad(r, box, rank1GradA, rank1GradB)
+			} else {
+				fillHGrad(r, box, hbarGradA, hbarGradB)
+			}
 			value := strconv.Itoa(s.Connections)
 			tv := chart.Draw.MeasureText(r, value, valueStyle)
 			chart.Draw.Text(r, value, topIPLabelRight+w+8, cy+tv.Height()>>1, valueStyle)
@@ -204,7 +259,7 @@ func renderTopIPPanel(tops []query.SrcIPStat) (image.Image, error) {
 
 	// 底部数值轴：横线 + 0/max 端点刻度。
 	axisY := height - topIPAxisBottomY
-	lineStyle.WriteToRenderer(r)
+	axisLine.WriteToRenderer(r)
 	r.MoveTo(topIPLabelRight, axisY)
 	r.LineTo(topIPPlotRight, axisY)
 	r.Stroke()

@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/modenc/e3-security-analyst/internal/query"
-	"github.com/wcharczuk/go-chart/v2/drawing"
 )
 
 // 图表类型与合成版式常量。
@@ -83,16 +82,15 @@ func (r *Renderer) Render(stats *query.Stats, kind string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// stackImages 将各面板按顺序纵向拼接为一张白底图像；各面板宽度一致
-// （由 imgWidth 保证）。
+// stackImages 将各面板按顺序纵向拼接为一张图像：底层是整幅深色渐变
+// 背景（theme.go），各面板透明底叠加其上；各面板宽度一致（由 imgWidth
+// 保证）。
 func stackImages(panels ...image.Image) *image.RGBA {
 	totalHeight := 0
 	for _, p := range panels {
 		totalHeight += p.Bounds().Dy()
 	}
-	canvas := image.NewRGBA(image.Rect(0, 0, imgWidth, totalHeight))
-	// 先铺白底：手绘面板（标题条/Top IP）背景透明，落到底色上呈现白底。
-	draw.Draw(canvas, canvas.Bounds(), image.NewUniform(drawing.ColorWhite), image.Point{}, draw.Src)
+	canvas := bgGradient(imgWidth, totalHeight)
 	y := 0
 	for _, p := range panels {
 		rect := image.Rect(0, y, imgWidth, y+p.Bounds().Dy())
