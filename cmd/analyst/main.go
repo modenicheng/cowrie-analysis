@@ -6,12 +6,17 @@
 //	daemon                       常驻：每 30s 补发 pending 通知 +
 //	                             每 10min 重试 72h 内 attempts<3 的失败报告 +
 //	                             启动时与每 24h 按保留期清理过期数据
-//	                             （app.retention_days=0 禁用）
-//	verify                       配置/环境自检（✓/✗ 清单，值绝不打印）
+//	                             （app.retention_days=0 禁用）与报告归档
+//	                             （reports.retention_days=0 禁用）
+//	verify                       配置/环境自检（✓/✗ 清单，值绝不打印；
+//	                             report_image.enabled 时含多吉云临时密钥
+//	                             换取检查）
 //
 // 公共约定：--config <path>（默认 /etc/e3-security-analyst/config.yaml，
 // 环境变量 E3_ANALYST_CONFIG 可覆盖）；凭据只经环境变量注入（llm.api_key_env
-// → DEEPSEEK_API_KEY，ntfy.token_env → NTFY_TOKEN），日志绝不输出其值。
+// → DEEPSEEK_API_KEY，ntfy.token_env → NTFY_TOKEN，report_image.*_env →
+// 多吉云密钥），日志绝不输出其值；report_image.enabled 且密钥 env 缺失时
+// 启动即报错退出。
 //
 // 退出码：0 正常；1 运行期错误（含 verify 发现 ✗）；2 配置/用法错误；
 // 3 report 子命令缺少 LLM API Key。
@@ -32,7 +37,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/modenc/e3-security-analyst/internal/chartimg"
 	"github.com/modenc/e3-security-analyst/internal/config"
+	"github.com/modenc/e3-security-analyst/internal/dogecloud"
 	"github.com/modenc/e3-security-analyst/internal/llm"
 	"github.com/modenc/e3-security-analyst/internal/logging"
 	"github.com/modenc/e3-security-analyst/internal/ntfy"
@@ -224,6 +231,47 @@ func assemble(cfg *config.Config, requireKey bool, log *slog.Logger) (*analystEn
 		_ = db.Close()
 		return nil, fmt.Errorf("创建报告生成器失败: %w", err)
 	}
+
+	// 报告图表管线（report_image，opt-in）：读密钥 env → 构造 dogecloud 客户端
+	// 与 chartimg 渲染器 → 注入 Generator。密钥缺失属配置错误，启动即失败
+	// （报错只含 env 名，绝不打印值）。
+	if cfg.ReportImage.Enabled {
+		accessKey := os.Getenv(cfg.ReportImage.AccessKeyEnv)
+		secretKey := os.Getenv(cfg.ReportImage.SecretKeyEnv)
+		if accessKey == "" || secretKey == "" {
+			_ = db.Close()
+			var missing []string
+			if accessKey == "" {
+				missing = append(missing, cfg.ReportImage.AccessKeyEnv)
+			}
+			if secretKey == "" {
+				missing = append(missing, cfg.ReportImage.SecretKeyEnv)
+			}
+			return nil, fmt.Errorf(
+				"report_image 已启用但多吉云密钥环境变量未设置: %s（值不打印；请经 systemd EnvironmentFile 注入）",
+				strings.Join(missing, "、"))
+		}
+		loc, locErr := cfg.Location()
+		if locErr != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("report_image: 加载时区 %q 失败: %w", cfg.App.Timezone, locErr)
+		}
+		doge := dogecloud.New(dogecloud.Config{
+			AccessKey:     accessKey,
+			SecretKey:     secretKey,
+			Bucket:        cfg.ReportImage.Bucket,
+			PublicBaseURL: cfg.ReportImage.PublicBaseURL,
+			KeyPrefix:     cfg.ReportImage.KeyPrefix,
+			RetentionDays: cfg.ReportImage.RetentionDays,
+		}, nil)
+		gen.SetImager(newDogeImager(doge, chartimg.New(loc)))
+		gen.SetNotifyMarkdown(cfg.Ntfy.Markdown)
+		log.Info("报告图表管线已启用",
+			"bucket", cfg.ReportImage.Bucket,
+			"key_prefix", cfg.ReportImage.KeyPrefix,
+			"retention_days", cfg.ReportImage.RetentionDays)
+	}
+
 	return &analystEnv{
 		cfg: cfg, db: db, gen: gen, publisher: publisher,
 		llmKey: llmKey, llmReady: llmKey != "",
@@ -325,6 +373,18 @@ func cmdDaemon(args []string) int {
 		log.Info("数据保留清理已禁用（app.retention_days=0）")
 	}
 
+	// 报告归档轮转：与数据保留同节奏（启动先跑一次 + 每 24h）；
+	// reports.retention_days=0 禁用（独立于 app.retention_days）。
+	var archivesC <-chan time.Time
+	if cfg.Reports.RetentionDays > 0 {
+		tick := time.NewTicker(daemonRetentionInterval)
+		defer tick.Stop()
+		archivesC = tick.C
+		env.archivesSweep(log)
+	} else {
+		log.Info("报告归档清理已禁用（reports.retention_days=0）")
+	}
+
 	// 启动即补发一次积压通知。
 	if sent, failedPerm, ferr := env.publisher.FlushPending(ctx); ferr != nil {
 		log.Warn("补发通知失败", "error", ferr)
@@ -350,6 +410,8 @@ func cmdDaemon(args []string) int {
 			env.retryFailedReports(ctx, log)
 		case <-retentionC:
 			env.retentionSweep(ctx, log)
+		case <-archivesC:
+			env.archivesSweep(log)
 		}
 	}
 }
@@ -403,6 +465,15 @@ func (e *analystEnv) retentionSweep(ctx context.Context, log *slog.Logger) {
 			"events", stats.Events, "sessions", stats.Sessions,
 			"parse_errors", stats.ParseErrors, "gaps", stats.Gaps,
 			"notifications", stats.Notifications)
+	}
+}
+
+// archivesSweep 执行一次报告归档目录轮转（reports.retention_days，按归档
+// 文件名内嵌日期删过期 .json/.png）。retention_days <= 0 时 CleanupArchives
+// 自行短路；失败仅 Warn 不影响 daemon 其余职责，等待下一轮（24h）重试。
+func (e *analystEnv) archivesSweep(log *slog.Logger) {
+	if err := reports.CleanupArchives(e.cfg.ReportsDir(), e.cfg.Reports.RetentionDays, time.Now()); err != nil {
+		log.Warn("报告归档清理失败", "error", err, "retention_days", e.cfg.Reports.RetentionDays)
 	}
 }
 
@@ -461,6 +532,29 @@ func cmdVerify(args []string) int {
 
 	check(schemeHTTPS(cfg.LLM.BaseURL), "llm.base_url 为 https: %s", cfg.LLM.BaseURL)
 	check(schemeHTTPS(cfg.Ntfy.BaseURL), "ntfy.base_url 为 https: %s", cfg.Ntfy.BaseURL)
+
+	// report_image 自检：密钥 env 已设置 + 多吉云临时密钥换取（仅验密钥，
+	// 零副作用，不做任何 S3 操作）；错误信息由 dogecloud 保证不含密钥值。
+	if cfg.ReportImage.Enabled {
+		ak := strings.TrimSpace(os.Getenv(cfg.ReportImage.AccessKeyEnv))
+		sk := strings.TrimSpace(os.Getenv(cfg.ReportImage.SecretKeyEnv))
+		check(ak != "" && sk != "", "环境变量 %s / %s 已设置（值不显示）",
+			cfg.ReportImage.AccessKeyEnv, cfg.ReportImage.SecretKeyEnv)
+		if ak != "" && sk != "" {
+			doge := dogecloud.New(dogecloud.Config{
+				AccessKey:     ak,
+				SecretKey:     sk,
+				Bucket:        cfg.ReportImage.Bucket,
+				PublicBaseURL: cfg.ReportImage.PublicBaseURL,
+				KeyPrefix:     cfg.ReportImage.KeyPrefix,
+				RetentionDays: cfg.ReportImage.RetentionDays,
+			}, nil)
+			vctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			tokErr := doge.FetchTmpToken(vctx)
+			cancel()
+			check(tokErr == nil, "多吉云临时密钥换取（零副作用）: %v", errOrOK(tokErr))
+		}
+	}
 
 	if !ok {
 		fmt.Println("verify：存在 ✗ 项，请修复后再运行")

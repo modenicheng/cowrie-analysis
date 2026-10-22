@@ -121,6 +121,10 @@ ntfy:
   max_retries: 5
   # 单条消息正文字节上限。范围 [500, 4096]（ntfy 服务端限制 4096）。
   max_message_bytes: 4000
+  # 带图报告通知是否按 Markdown 语法发送（"Markdown: yes" 头，加粗统计行、
+  # 内嵌图表等）。需 ntfy 服务端 >= 2.11.0；旧版本会把原始语法文本原样
+  # 展示，此时可设为 false 回退纯文本（图表仍以附件直链携带）。
+  markdown: true
 
 alerts:
   # 是否启用确定性实时告警（不依赖 LLM；false 时 collector 只采集入库）。
@@ -151,3 +155,30 @@ reports:
   dir: ""
   # 模型单次查询允许的最大时间跨度（天）。范围 [1, 366]。
   max_query_span_days: 31
+  # 报告归档保留期（天）：e3-analyst daemon 启动时与每 24h 按归档文件名
+  # 内嵌日期轮转 reports 目录 YYYY/MM 下的 daily-/weekly-*.json 与 *.png，
+  # 超过保留期的文件删除、变空的月/年目录顺手移除。0 = 禁用轮转。
+  # 注意：默认 90 属默认开启的行为变更（历史版本归档永久保留），如需
+  # 旧行为请显式设为 0。范围 [0, 3650]。
+  retention_days: 90
+
+# 报告图表托管（渲染统计图表 PNG → 上传多吉云标准型存储桶 → ntfy 通知
+# 携带直链附件）。默认整体关闭；任一环节失败仅降级为纯文本通知，不影响
+# 报告本身。密钥经下方 *_env 指定的环境变量注入（值经
+# /etc/e3-security-analyst/doge.env 加载，0600 e3sec:e3sec；本文件不写
+# 密钥本体），启用后密钥缺失时 e3-analyst 启动即报错退出。
+report_image:
+  # 是否启用报告图表管线（opt-in，默认 false）。
+  enabled: false
+  # 多吉云 AccessKey / SecretKey 所在环境变量名。
+  access_key_env: DOGECLOUD_ACCESS_KEY
+  secret_key_env: DOGECLOUD_SECRET_KEY
+  # 标准型存储桶名（低频型桶不支持 API 上传）。启用时必填。
+  bucket: ""
+  # 桶绑定的公网直链域名（https）。启用时必填。
+  public_base_url: https://img-host.modenc.top
+  # 桶内对象 key 前缀；留空保持默认 e3-reports/。
+  key_prefix: e3-reports/
+  # 桶内图表对象保留期（天）：每次成功上传后按此值清理过期对象。
+  # 0 = 禁用桶内清理。范围 [0, 3650]。
+  retention_days: 90

@@ -376,6 +376,81 @@ func TestPublishContextCanceledReturnsImmediately(t *testing.T) {
 	}
 }
 
+// 补充：Markdown=true 携带 "Markdown: yes" 头、Attach 非空携带 "Attach"
+// 头（原值透传）；两者缺席时对应头不存在（与历史行为一致）。
+func TestPublishMarkdownAndAttachHeaders(t *testing.T) {
+	srv, rec := startServer(t, http.StatusOK, `{"id":"img"}`, 0)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Timeout: 5 * time.Second})
+
+	attachURL := "https://img-host.modenc.top/e3-reports/daily/20261022-abcd.png"
+	m := validMsg()
+	m.Markdown = true
+	m.Attach = attachURL
+	if _, err := c.Publish(context.Background(), m); err != nil {
+		t.Fatalf("Publish() error = %v, want nil", err)
+	}
+	_, _, _, hdr := rec.snapshot()
+	if got := hdr.Get("Markdown"); got != "yes" {
+		t.Errorf("Markdown header = %q, want %q", got, "yes")
+	}
+	if got := hdr.Get("Attach"); got != attachURL {
+		t.Errorf("Attach header = %q, want %q", got, attachURL)
+	}
+
+	// 缺席：默认消息（Markdown=false、Attach=""）不携带两个头。
+	if _, err := c.Publish(context.Background(), validMsg()); err != nil {
+		t.Fatalf("Publish() plain error = %v, want nil", err)
+	}
+	_, _, _, hdr = rec.snapshot()
+	for _, name := range []string{"Markdown", "Attach"} {
+		if _, ok := hdr[name]; ok {
+			t.Errorf("%s header present (%q), want absent", name, hdr.Get(name))
+		}
+	}
+}
+
+// 补充：非法 Attach（非 URL、ftp scheme、超长）本地拒绝且不发任何请求。
+func TestPublishInvalidAttachRejectedLocally(t *testing.T) {
+	srv, rec := startServer(t, http.StatusOK, `{"id":"x"}`, 0)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Timeout: 5 * time.Second})
+
+	badAttaches := []string{
+		"notaurl",                           // 无 scheme/host
+		"ftp://files.example.com/chart.png", // 非 http(s) scheme
+		"http://" + strings.Repeat("a", maxAttachBytes+1),  // 超长（2049 字节）
+		"https://" + strings.Repeat("a", maxAttachBytes+2), // 超长（https 也拒）
+	}
+	for _, attach := range badAttaches {
+		m := validMsg()
+		m.Attach = attach
+		_, err := c.Publish(context.Background(), m)
+		if err == nil {
+			t.Errorf("attach %q(...%d bytes): error = nil, want reject", attach[:16], len(attach))
+			continue
+		}
+		var ve *ValidationError
+		if !errors.As(err, &ve) || ve.Field != "attach" {
+			t.Errorf("attach (%d bytes): error = %v, want ValidationError{attach}", len(attach), err)
+		}
+		if IsRetryable(err) {
+			t.Errorf("attach (%d bytes): IsRetryable = true, want false", len(attach))
+		}
+	}
+	if got := rec.hits.Load(); got != 0 {
+		t.Errorf("request count = %d, want 0 (must reject before any request)", got)
+	}
+
+	// 边界：恰好 maxAttachBytes 字节的合法 https URL 应放行。
+	m := validMsg()
+	m.Attach = "https://img.example.com/" + strings.Repeat("a", maxAttachBytes-len("https://img.example.com/"))
+	if len(m.Attach) != maxAttachBytes {
+		t.Fatalf("构造边界附件长度失败: %d", len(m.Attach))
+	}
+	if _, err := c.Publish(context.Background(), m); err != nil {
+		t.Errorf("exact-limit attach err = %v, want success", err)
+	}
+}
+
 // 补充：SetHTTPClient 注入的客户端被实际使用。
 type roundTripFunc func(*http.Request) (*http.Response, error)
 

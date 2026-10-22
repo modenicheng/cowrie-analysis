@@ -83,6 +83,10 @@ type Config struct {
 		TimeoutSeconds  int    `yaml:"timeout_seconds"`
 		MaxRetries      int    `yaml:"max_retries"`
 		MaxMessageBytes int    `yaml:"max_message_bytes"`
+		// Markdown 控制带图报告通知是否以 Markdown 语法发送（"Markdown: yes"
+		// 头）。需 ntfy 服务端 >= 2.11.0；旧版本会把原始语法文本原样展示，
+		// 此时可设为 false 回退纯文本。
+		Markdown bool `yaml:"markdown"`
 	} `yaml:"ntfy"`
 
 	Alerts struct {
@@ -102,7 +106,33 @@ type Config struct {
 		IncludeCommands  bool   `yaml:"include_commands"`
 		Dir              string `yaml:"dir"`
 		MaxQuerySpanDays int    `yaml:"max_query_span_days"`
+		// RetentionDays 是报告归档目录（YYYY/MM 下的 .json/.png）的保留期
+		// （天），由 e3-analyst daemon 启动时与每 24h 按文件名内嵌日期轮转。
+		// 0 = 禁用归档轮转。注意：默认 90 属默认开启的行为变更（历史归档
+		// 永久保留），如需旧行为请显式设为 0。范围 [0, 3650]。
+		RetentionDays int `yaml:"retention_days"`
 	} `yaml:"reports"`
+
+	// ReportImage 配置报告图表托管（渲染 PNG → 上传多吉云标准型存储桶 →
+	// ntfy 通知携带直链）。默认整体关闭（enabled=false，报告不带图表）。
+	ReportImage struct {
+		// Enabled 是否启用报告图表管线；启用后多吉云密钥环境变量缺失时
+		// e3-analyst 启动即报错退出。
+		Enabled bool `yaml:"enabled"`
+		// AccessKeyEnv / SecretKeyEnv 是多吉云密钥的环境变量名（值经
+		// systemd EnvironmentFile 注入，本文件绝不出现密钥本体）。
+		AccessKeyEnv string `yaml:"access_key_env"`
+		SecretKeyEnv string `yaml:"secret_key_env"`
+		// Bucket 是标准型存储桶名（低频型桶不支持 API 上传）。
+		Bucket string `yaml:"bucket"`
+		// PublicBaseURL 是桶绑定的公网直链域名（https）。
+		PublicBaseURL string `yaml:"public_base_url"`
+		// KeyPrefix 是桶内对象 key 前缀；留空保持默认 e3-reports/。
+		KeyPrefix string `yaml:"key_prefix"`
+		// RetentionDays 是桶内图表对象的保留期（天），每次成功上传后按
+		// 此值清理过期对象；0 = 禁用桶内清理。范围 [0, 3650]。
+		RetentionDays int `yaml:"retention_days"`
+	} `yaml:"report_image"`
 }
 
 var (
@@ -154,6 +184,7 @@ func Default() *Config {
 	c.Ntfy.TimeoutSeconds = 10
 	c.Ntfy.MaxRetries = 5
 	c.Ntfy.MaxMessageBytes = 4000
+	c.Ntfy.Markdown = true
 
 	c.Alerts.Enabled = true
 	c.Alerts.MaxPerMinute = 10
@@ -168,6 +199,15 @@ func Default() *Config {
 	c.Reports.IncludePaths = true
 	c.Reports.IncludeCommands = true
 	c.Reports.MaxQuerySpanDays = 31
+	c.Reports.RetentionDays = 90
+
+	c.ReportImage.Enabled = false // 默认关闭（opt-in）
+	c.ReportImage.AccessKeyEnv = "DOGECLOUD_ACCESS_KEY"
+	c.ReportImage.SecretKeyEnv = "DOGECLOUD_SECRET_KEY"
+	c.ReportImage.Bucket = ""
+	c.ReportImage.PublicBaseURL = "https://img-host.modenc.top"
+	c.ReportImage.KeyPrefix = "e3-reports/"
+	c.ReportImage.RetentionDays = 90
 	return c
 }
 
@@ -364,6 +404,28 @@ func (c *Config) Validate() error {
 	if err := inRange(c.Reports.MaxQuerySpanDays, 1, 366, "reports.max_query_span_days"); err != nil {
 		return err
 	}
+	if err := inRange(c.Reports.RetentionDays, 0, 3650, "reports.retention_days"); err != nil {
+		return err
+	}
+
+	if c.ReportImage.Enabled {
+		if c.ReportImage.Bucket == "" {
+			return fmt.Errorf("report_image.bucket 不能为空（启用 report_image 时必须指定标准型存储桶）")
+		}
+		if err := checkHTTPURL(c.ReportImage.PublicBaseURL, "report_image.public_base_url"); err != nil {
+			return err
+		}
+		if err := checkEnvName(c.ReportImage.AccessKeyEnv, "report_image.access_key_env"); err != nil {
+			return err
+		}
+		if err := checkEnvName(c.ReportImage.SecretKeyEnv, "report_image.secret_key_env"); err != nil {
+			return err
+		}
+		// KeyPrefix 留空不报错：运行时保持默认 e3-reports/。
+	}
+	if err := inRange(c.ReportImage.RetentionDays, 0, 3650, "report_image.retention_days"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -408,9 +470,11 @@ func redactURL(raw string) string {
 }
 
 // Redacted 返回用于日志的脱敏摘要：只展示密钥的环境变量名，绝不展示解析值；
-// llm/ntfy base_url 打印前剥离 URL userinfo。
+// llm/ntfy base_url 打印前剥离 URL userinfo；report_image 只含开关、桶名与
+// 环境变量名（均为非敏感项）。
 func (c *Config) Redacted() string {
-	return fmt.Sprintf("config{timezone=%s state_dir=%s db=%s llm=%s model=%s key_env=%s ntfy=%s token_env=%s topic=%s}",
+	return fmt.Sprintf("config{timezone=%s state_dir=%s db=%s llm=%s model=%s key_env=%s ntfy=%s token_env=%s topic=%s report_image=enabled:%t bucket=%s ak_env=%s sk_env=%s}",
 		c.App.Timezone, c.App.StateDir, c.Database.Path, redactURL(c.LLM.BaseURL), c.LLM.Model,
-		c.LLM.APIKeyEnv, redactURL(c.Ntfy.BaseURL), c.Ntfy.TokenEnv, c.Ntfy.Topic)
+		c.LLM.APIKeyEnv, redactURL(c.Ntfy.BaseURL), c.Ntfy.TokenEnv, c.Ntfy.Topic,
+		c.ReportImage.Enabled, c.ReportImage.Bucket, c.ReportImage.AccessKeyEnv, c.ReportImage.SecretKeyEnv)
 }

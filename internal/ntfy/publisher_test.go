@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -312,5 +313,44 @@ func TestFlushPendingCountsAndSkipsDigest(t *testing.T) {
 	}
 	if status, _, _ := notificationStatus(t, db, "k-digest"); status != "pending" {
 		t.Errorf("k-digest status = %q, want pending（等待 FlushDigest 汇总）", status)
+	}
+}
+
+// 7. 通知的 Attach/Markdown 字段经 messageFromNotification 映射到请求头：
+// 入队→TrySend 全链路后 mock 服务端应看到 Attach 与 "Markdown: yes"。
+func TestTrySendPropagatesAttachAndMarkdown(t *testing.T) {
+	var mu sync.Mutex
+	var gotAttach, gotMarkdown string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		gotAttach = r.Header.Get("Attach")
+		gotMarkdown = r.Header.Get("Markdown")
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"img1"}`)
+	}))
+	t.Cleanup(srv.Close)
+	db := pubOpenDB(t)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, Timeout: 5 * time.Second})
+	pub := NewPublisher(c, db, 2, 4000, pubQuietLogger())
+	ctx := context.Background()
+
+	n := pubNotification("k-attach", "alerts")
+	n.Attach = "https://img-host.modenc.top/e3-reports/daily/20261022-abcd.png"
+	n.Markdown = true
+	if _, err := pub.Enqueue(ctx, n); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := pub.TrySend(ctx, n); err != nil {
+		t.Fatalf("TrySend error = %v, want nil", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if gotAttach != n.Attach {
+		t.Errorf("Attach header = %q, want %q", gotAttach, n.Attach)
+	}
+	if gotMarkdown != "yes" {
+		t.Errorf("Markdown header = %q, want %q", gotMarkdown, "yes")
 	}
 }

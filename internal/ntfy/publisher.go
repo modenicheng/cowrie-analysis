@@ -237,7 +237,8 @@ func (p *Publisher) FlushPending(ctx context.Context) (sent int, failedPerm int,
 }
 
 // messageFromNotification 把存储层通知转换为 Client 消息（Tags 从逗号
-// 分隔字符串还原为数组）。
+// 分隔字符串还原为数组；Attach/Markdown 直传，缺席时 Client 不携带
+// 对应请求头）。
 func messageFromNotification(n *store.Notification) Message {
 	var tags []string
 	for _, t := range strings.Split(n.Tags, ",") {
@@ -251,6 +252,8 @@ func messageFromNotification(n *store.Notification) Message {
 		Body:     n.Body,
 		Priority: n.Priority,
 		Tags:     tags,
+		Attach:   n.Attach,
+		Markdown: n.Markdown,
 	}
 }
 

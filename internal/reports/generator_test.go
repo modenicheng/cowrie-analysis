@@ -182,6 +182,7 @@ func (m *llmMock) requests() []string {
 
 type ntfyReq struct {
 	Path, Title, Body, Priority, Tags, Auth string
+	Attach, Markdown                        string
 }
 
 type ntfyMock struct {
@@ -204,6 +205,8 @@ func newNtfyMock(t *testing.T) *ntfyMock {
 			Priority: r.Header.Get("Priority"),
 			Tags:     r.Header.Get("Tags"),
 			Auth:     r.Header.Get("Authorization"),
+			Attach:   r.Header.Get("Attach"),
+			Markdown: r.Header.Get("Markdown"),
 		})
 		status := m.status
 		m.mu.Unlock()
@@ -473,6 +476,13 @@ type archivePayload struct {
 		LoginSuccess int `json:"login_success"`
 		LoginFailed  int `json:"login_failed"`
 	} `json:"stats"`
+	Image *struct {
+		URL         string    `json:"url"`
+		Key         string    `json:"key"`
+		SHA256      string    `json:"sha256"`
+		Bytes       int       `json:"bytes"`
+		GeneratedAt time.Time `json:"generated_at"`
+	} `json:"image"`
 	Model map[string]any `json:"model"`
 }
 

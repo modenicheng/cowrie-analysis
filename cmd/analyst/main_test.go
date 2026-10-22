@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,7 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modenc/e3-security-analyst/internal/chartimg"
 	"github.com/modenc/e3-security-analyst/internal/config"
+	"github.com/modenc/e3-security-analyst/internal/dogecloud"
+	"github.com/modenc/e3-security-analyst/internal/query"
+	"github.com/modenc/e3-security-analyst/internal/reports"
 	"github.com/modenc/e3-security-analyst/internal/store"
 
 	"github.com/modenc/e3-security-analyst/migrations"
@@ -171,5 +178,176 @@ func TestRetentionSweep(t *testing.T) {
 	oldFilter := store.EventFilter{Since: old.Add(-time.Minute), Until: old.Add(time.Minute)}
 	if n, err := db.CountEvents(ctx, oldFilter); err != nil || n != 0 {
 		t.Fatalf("老事件应已删除, got %d (err %v)", n, err)
+	}
+}
+
+// TestArchivesSweep：daemon 报告归档轮转的最小端到端验证——
+// reports.retention_days=0 时不动任何文件；>0 时按文件名日期老删新留。
+// （24h ticker 的循环接线本身不可单测，靠该函数覆盖清理路径。）
+func TestArchivesSweep(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Reports.Dir = root
+	env := &analystEnv{cfg: cfg}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sweepNow := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	oldRel := filepath.Join("2025", "09", "daily-20250901.json")
+	newRel := filepath.Join("2026", "10", "daily-20261021.json")
+	for _, rel := range []string{oldRel, newRel} {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+
+	// 0 = 禁用：两份归档都在。
+	cfg.Reports.RetentionDays = 0
+	env.archivesSweep(log) // 内部 time.Now()：retention=0 直接短路，与时钟无关
+	for _, rel := range []string{oldRel, newRel} {
+		if _, err := os.Stat(filepath.Join(root, rel)); err != nil {
+			t.Fatalf("禁用轮转后 %s 不应缺失: %v", rel, err)
+		}
+	}
+
+	// 90 天：老归档删除、新归档保留（经 reports.CleanupArchives 固定时钟验证）。
+	if err := reports.CleanupArchives(root, 90, sweepNow); err != nil {
+		t.Fatalf("CleanupArchives: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, oldRel)); !os.IsNotExist(err) {
+		t.Errorf("老归档应已删除 (stat err=%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, newRel)); err != nil {
+		t.Errorf("新归档不应删除: %v", err)
+	}
+}
+
+// —— dogeImager 适配器：Render/Upload/Prune 到 chartimg/dogecloud 的映射 ——
+
+// dogeTestTransport 把多吉云 API 请求与 virtual-host 风格（{bucket}.{host}）
+// 的 S3 请求都路由到同一个 httptest 服务，其余原样放行。
+type dogeTestTransport struct {
+	handler http.HandlerFunc
+}
+
+func (t dogeTestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rec := httptest.NewRecorder()
+	t.handler(rec, req)
+	resp := rec.Result()
+	return resp, nil
+}
+
+// newFakeDogeServer 启动假多吉云服务：/auth/tmp_token.json 发临时密钥
+// （s3Endpoint 指回自身），PUT /{key} 记录请求体并返回 200；LIST 返回空集。
+func newFakeDogeServer(t *testing.T) (*httptest.Server, *[]byte, *[]string) {
+	t.Helper()
+	var putBody []byte
+	var putPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/auth/tmp_token.json":
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"code":200,"msg":"ok","data":{"Credentials":{"AccessKeyId":"STS_AK","SecretAccessKey":"STS_SK","SessionToken":"STS_TK"},"Buckets":[{"s3Bucket":"e3-test-bucket","s3Endpoint":%q}]}}`,
+				"http://"+r.Host)
+		case r.Method == http.MethodPut:
+			b, _ := io.ReadAll(r.Body)
+			putBody = b
+			putPaths = append(putPaths, r.URL.EscapedPath())
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet: // ListObjectsV2：空结果
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`)
+		default:
+			w.WriteHeader(http.StatusForbidden)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &putBody, &putPaths
+}
+
+// TestDogeImagerRenderUploadPruneMapping：Render 委托 chartimg 产出 PNG；
+// Upload 用 NewKey 生成 key（含 kind/日期/前缀与 .png 后缀）并上传原始字节、
+// 返回 PublicBaseURL+key 直链；Prune 走 LIST 空集成功返回。
+func TestDogeImagerRenderUploadPruneMapping(t *testing.T) {
+	srv, putBody, putPaths := newFakeDogeServer(t)
+	doge := dogecloud.New(dogecloud.Config{
+		AccessKey:     "ak-test",
+		SecretKey:     "sk-test",
+		Bucket:        "e3-test-bucket",
+		PublicBaseURL: "https://img-host.example.top/",
+		KeyPrefix:     "e3-reports/",
+		APIBaseURL:    srv.URL,
+		RetentionDays: 30,
+	}, &http.Client{Transport: dogeTestTransport{handler: func(w http.ResponseWriter, r *http.Request) {
+		// 统一改写 host 后交给同一假服务（virtual-host 风格的 S3 请求
+		// 目标是 {bucket}.{api host}，测试 transport 直接按路径处理）。
+		srv.Config.Handler.ServeHTTP(w, r)
+	}}})
+	adapter := newDogeImager(doge, chartimg.New(time.UTC))
+
+	// Render：委托 chartimg（零事件窗口仍产出合法 PNG）。
+	stats := &query.Stats{
+		Since: time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC),
+		Until: time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC),
+	}
+	png, err := adapter.Render(stats, "daily", stats.Since, stats.Until)
+	if err != nil {
+		t.Fatalf("Render 失败: %v", err)
+	}
+	if len(png) < 8 || string(png[:4]) != "\x89PNG" {
+		t.Fatalf("Render 产物不是 PNG: 前 8 字节 %x", png[:8])
+	}
+
+	// Upload：key 布局 + 直链 + 上传字节一致。
+	since := time.Date(2026, 10, 21, 16, 0, 0, 0, time.UTC)
+	key, publicURL, err := adapter.Upload(context.Background(), "daily", since, png)
+	if err != nil {
+		t.Fatalf("Upload 失败: %v", err)
+	}
+	wantKeyPrefix := "e3-reports/daily/20261021-"
+	if !strings.HasPrefix(key, wantKeyPrefix) || !strings.HasSuffix(key, ".png") {
+		t.Errorf("key = %q, 期望前缀 %q 且 .png 结尾", key, wantKeyPrefix)
+	}
+	if want := "https://img-host.example.top/" + key; publicURL != want {
+		t.Errorf("publicURL = %q, 期望 %q", publicURL, want)
+	}
+	if !bytes.Equal(*putBody, png) {
+		t.Errorf("上传字节与 Render 产物不一致: %d vs %d 字节", len(*putBody), len(png))
+	}
+	if len(*putPaths) != 1 || (*putPaths)[0] != "/"+key {
+		t.Errorf("PUT 路径 = %v, 期望 [/%s]", *putPaths, key)
+	}
+
+	// Prune：LIST 空集 → (0, nil)，适配器透传为 nil。
+	if err := adapter.Prune(context.Background()); err != nil {
+		t.Errorf("Prune 失败（空桶应无错误）: %v", err)
+	}
+}
+
+// TestDogeImagerUploadFailurePropagates：多吉云侧错误原样透传（key 为空），
+// 由 reports.Generator 统一降级。
+func TestDogeImagerUploadFailurePropagates(t *testing.T) {
+	// 直接对不可达端口构造客户端：网络错误即透传。
+	doge := dogecloud.New(dogecloud.Config{
+		AccessKey:     "ak-test",
+		SecretKey:     "sk-test",
+		Bucket:        "e3-test-bucket",
+		PublicBaseURL: "https://img-host.example.top",
+		KeyPrefix:     "e3-reports/",
+		APIBaseURL:    "http://127.0.0.1:1", // 不可达
+		Timeout:       500 * time.Millisecond,
+	}, nil)
+	adapter := newDogeImager(doge, chartimg.New(time.UTC))
+	key, publicURL, err := adapter.Upload(context.Background(), "daily", time.Now().UTC(), []byte("png"))
+	if err == nil {
+		t.Fatal("Upload 应失败（API 不可达）")
+	}
+	if key != "" || publicURL != "" {
+		t.Errorf("失败时 key/publicURL 应为空: %q/%q", key, publicURL)
+	}
+	if strings.Contains(err.Error(), "sk-test") {
+		t.Errorf("错误信息不得包含密钥: %v", err)
 	}
 }

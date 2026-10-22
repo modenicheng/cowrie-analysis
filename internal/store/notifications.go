@@ -15,13 +15,17 @@ type Notification struct {
 	DedupeKey                string
 	Kind                     string // 如 alert.login_success / alert.login_failed / report.daily
 	Topic, Title, Body, Tags string // Tags 为逗号分隔
-	Priority                 int    // ntfy 1..5
-	Status                   string // pending|sent|failed
-	Attempts                 int
-	LastError                string
-	MergedCount              int // 限流时被合并的附加事件数
-	CreatedAt                time.Time
-	SentAt, LastAttemptAt    *time.Time
+	// Attach 是外链附件 URL（ntfy Attach 头，如报告图表直链）；空则不携带。
+	Attach string
+	// Markdown 表示正文是否按 Markdown 语法发送（ntfy >= 2.11.0）。
+	Markdown              bool
+	Priority              int    // ntfy 1..5
+	Status                string // pending|sent|failed
+	Attempts              int
+	LastError             string
+	MergedCount           int // 限流时被合并的附加事件数
+	CreatedAt             time.Time
+	SentAt, LastAttemptAt *time.Time
 }
 
 // EnqueueNotification 按 dedupe_key 幂等入队：已存在时返回 existed=true
@@ -40,12 +44,12 @@ func (db *DB) EnqueueNotification(ctx context.Context, n *Notification) (existed
 		n.CreatedAt = time.Now().UTC()
 	}
 	res, err := db.sql.ExecContext(ctx, `INSERT INTO notifications
-		(dedupe_key, kind, topic, title, body, priority, tags, status,
+		(dedupe_key, kind, topic, title, body, priority, tags, attach, markdown, status,
 		 last_error, merged_count, created_at, sent_at, last_attempt_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(dedupe_key) DO NOTHING`,
 		n.DedupeKey, n.Kind, n.Topic, n.Title, n.Body, n.Priority, n.Tags,
-		n.Status, n.LastError, n.MergedCount, fmtTime(n.CreatedAt),
+		n.Attach, n.Markdown, n.Status, n.LastError, n.MergedCount, fmtTime(n.CreatedAt),
 		fmtTimePtr(n.SentAt), fmtTimePtr(n.LastAttemptAt))
 	if err != nil {
 		return false, fmt.Errorf("store.EnqueueNotification: %w", err)
@@ -78,7 +82,7 @@ func (db *DB) BumpNotification(ctx context.Context, dedupeKey string) error {
 }
 
 const notificationCols = `id, dedupe_key, kind, topic, title, body, priority, tags,
-	status, attempts, last_error, merged_count, created_at, sent_at, last_attempt_at`
+	attach, markdown, status, attempts, last_error, merged_count, created_at, sent_at, last_attempt_at`
 
 // PendingNotifications 按入队顺序返回 status=pending 的通知；
 // limit <= 0 表示不限制条数。
@@ -181,21 +185,24 @@ func (db *DB) NotificationStats(ctx context.Context, since time.Time) (sent, pen
 	return sent, pending, failed, nil
 }
 
-// scanNotification 从一行扫描出 Notification。
+// scanNotification 从一行扫描出 Notification（markdown 列为 INTEGER，
+// 按 int64 读出后转 bool；旧行默认值 0 即 false）。
 func scanNotification(sc interface{ Scan(dest ...any) error }) (*Notification, error) {
 	var (
 		n                   Notification
 		tags, lastErr       sql.NullString
+		markdown            int64
 		createdAt           string
 		sentAt, lastAttempt sql.NullString
 	)
 	if err := sc.Scan(&n.ID, &n.DedupeKey, &n.Kind, &n.Topic, &n.Title, &n.Body,
-		&n.Priority, &tags, &n.Status, &n.Attempts, &lastErr, &n.MergedCount,
-		&createdAt, &sentAt, &lastAttempt); err != nil {
+		&n.Priority, &tags, &n.Attach, &markdown, &n.Status, &n.Attempts, &lastErr,
+		&n.MergedCount, &createdAt, &sentAt, &lastAttempt); err != nil {
 		return nil, err
 	}
 	n.Tags = tags.String
 	n.LastError = lastErr.String
+	n.Markdown = markdown != 0
 	var err error
 	if n.CreatedAt, err = parseTime(createdAt); err != nil {
 		return nil, err

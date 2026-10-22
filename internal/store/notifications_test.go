@@ -169,3 +169,69 @@ func TestNotificationLifecycle(t *testing.T) {
 		t.Error("不存在的通知 MarkSent 应报错")
 	}
 }
+
+// TestNotificationAttachMarkdownRoundtrip：新列 attach/markdown 入队后经
+// PendingNotifications 读回一致；未设置时保持默认 ”/false（旧行为）。
+func TestNotificationAttachMarkdownRoundtrip(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	attach := "https://img-host.modenc.top/e3-reports/daily/20261022-abcd.png"
+	n := mkNotification("report.daily:20261022")
+	n.Kind = "report.daily"
+	n.Attach = attach
+	n.Markdown = true
+	if _, err := db.EnqueueNotification(ctx, n); err != nil {
+		t.Fatalf("Enqueue 失败: %v", err)
+	}
+
+	pending, err := db.PendingNotifications(ctx, 0)
+	if err != nil {
+		t.Fatalf("PendingNotifications 失败: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending 行数 = %d, 期望 1", len(pending))
+	}
+	got := pending[0]
+	if got.Attach != attach {
+		t.Errorf("回读 attach = %q, 期望 %q", got.Attach, attach)
+	}
+	if !got.Markdown {
+		t.Error("回读 markdown = false, 期望 true")
+	}
+
+	// 未设置两字段的普通通知：默认 ''/false，不携带附件与 Markdown。
+	plain := mkNotification("alert.plain:s9")
+	if _, err := db.EnqueueNotification(ctx, plain); err != nil {
+		t.Fatalf("Enqueue plain 失败: %v", err)
+	}
+	pending, err = db.PendingNotifications(ctx, 0)
+	if err != nil {
+		t.Fatalf("PendingNotifications 失败: %v", err)
+	}
+	var plainGot *Notification
+	for _, p := range pending {
+		if p.DedupeKey == plain.DedupeKey {
+			plainGot = p
+		}
+	}
+	if plainGot == nil {
+		t.Fatal("未找到 plain 通知")
+	}
+	if plainGot.Attach != "" || plainGot.Markdown {
+		t.Errorf("plain 通知默认值异常: attach=%q markdown=%v, 期望空/false",
+			plainGot.Attach, plainGot.Markdown)
+	}
+
+	// 迁移列存在性：直接 SQL 断言两列与默认值语义。
+	var defAttach string
+	var defMarkdown int64
+	if err := db.SQL().QueryRow(
+		`SELECT attach, markdown FROM notifications WHERE dedupe_key = ?`,
+		plain.DedupeKey).Scan(&defAttach, &defMarkdown); err != nil {
+		t.Fatalf("查询迁移列失败: %v", err)
+	}
+	if defAttach != "" || defMarkdown != 0 {
+		t.Errorf("迁移列默认值异常: attach=%q markdown=%d", defAttach, defMarkdown)
+	}
+}

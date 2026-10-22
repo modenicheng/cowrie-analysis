@@ -3,6 +3,7 @@ package reports
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -42,6 +43,13 @@ type Generator struct {
 	log    *slog.Logger
 	loc    *time.Location
 
+	// imager 为 nil 时无图表（现行为）；由 cmd/analyst 在启用 report_image
+	// 时经 SetImager 注入，必须在首次 Generate 之前调用。
+	imager ReportImager
+	// notifyMarkdown 控制带图通知是否按 Markdown 发送（默认 true）；
+	// 由 cmd/analyst 经 SetNotifyMarkdown 注入 cfg.Ntfy.Markdown。
+	notifyMarkdown bool
+
 	// disp 是契约规定的 Generator 自有 Dispatcher（submitter=Generator
 	// 自身，见 CONTRACTS internal/reports）。Generate 实际执行时另建
 	// run 级 Dispatcher 绑定局部草稿校验器，避免并发任务互相串状态；
@@ -73,13 +81,14 @@ func NewGenerator(cfg *config.Config, db *store.DB, client *llm.Client,
 		return nil, fmt.Errorf("reports.NewGenerator: 加载时区 %q 失败: %w", cfg.App.Timezone, err)
 	}
 	g := &Generator{
-		cfg:    cfg,
-		db:     db,
-		client: client,
-		runner: runner,
-		pub:    pub,
-		log:    log,
-		loc:    loc,
+		cfg:            cfg,
+		db:             db,
+		client:         client,
+		runner:         runner,
+		pub:            pub,
+		log:            log,
+		loc:            loc,
+		notifyMarkdown: true,
 	}
 	g.disp = tools.NewDispatcher(cfg, db, runner, g, log)
 	return g, nil
@@ -240,9 +249,40 @@ func (g *Generator) Generate(ctx context.Context, kind string) error {
 		}
 	}
 
+	// —— 步骤 8.5：图表渲染与上传（imager 非 nil 时）——
+	// Render/Upload 任一失败仅 log.Warn 并降级为纯文本通知（img=nil），
+	// 不影响报告状态机；Prune 失败同样仅告警。
+	var img *payloadImage
+	var chartPNG []byte
+	if g.imager != nil {
+		png, rerr := g.imager.Render(stats, kind, since, until)
+		if rerr != nil {
+			g.log.Warn("报告图表渲染失败，降级为纯文本通知", "kind", kind, "err", rerr)
+		} else {
+			key, publicURL, uerr := g.imager.Upload(ctx, kind, since, png)
+			if uerr != nil {
+				g.log.Warn("报告图表上传失败，降级为纯文本通知", "kind", kind, "err", uerr)
+			} else {
+				sum := sha256.Sum256(png)
+				img = &payloadImage{
+					URL:         publicURL,
+					Key:         key,
+					SHA256:      hex.EncodeToString(sum[:]),
+					Bytes:       len(png),
+					GeneratedAt: time.Now().UTC(),
+				}
+				chartPNG = png
+				if perr := g.imager.Prune(ctx); perr != nil {
+					g.log.Warn("报告图表桶内清理失败（不影响报告）", "kind", kind, "err", perr)
+				}
+			}
+		}
+	}
+
 	// —— 步骤 9：归档与落库 ——
 	payload := g.buildPayload(kind, since, until, stats, draftRaw)
-	data, sha, archivePath, err := g.archiveReport(kind, since, payload)
+	payload.Image = img
+	data, sha, archivePath, err := g.archiveReport(kind, since, payload, chartPNG)
 	if err != nil {
 		return fail(err)
 	}
@@ -256,7 +296,7 @@ func (g *Generator) Generate(ctx context.Context, kind string) error {
 
 	// —— 步骤 10：ntfy 发布（发送失败不算生成失败）——
 	if g.pub != nil {
-		if err := g.publishReport(ctx, kind, since, until, draft, stats.Quality.Gaps, archivePath); err != nil {
+		if err := g.publishReport(ctx, kind, since, until, draft, stats.Quality.Gaps, archivePath, img); err != nil {
 			return fail(err)
 		}
 		if status := g.notificationStatus(ctx, fmt.Sprintf("report:%s:%d", kind, since.Unix())); status == "sent" {

@@ -281,3 +281,172 @@ database:
 		t.Errorf("retention_days=9999 应在 Load 时报错且含字段名, got %v", err)
 	}
 }
+
+// ntfy.markdown 默认 true；reports.retention_days 默认 90（默认开启的
+// 行为变更）；report_image 默认关闭且默认值齐全；默认配置整体通过校验。
+func TestReportDefaults(t *testing.T) {
+	c := Default()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Default() 应通过校验: %v", err)
+	}
+	if !c.Ntfy.Markdown {
+		t.Error("默认 ntfy.markdown = false, want true")
+	}
+	if c.Reports.RetentionDays != 90 {
+		t.Errorf("默认 reports.retention_days = %d, want 90", c.Reports.RetentionDays)
+	}
+	if c.ReportImage.Enabled {
+		t.Error("默认 report_image.enabled = true, want false（opt-in）")
+	}
+	if c.ReportImage.AccessKeyEnv != "DOGECLOUD_ACCESS_KEY" {
+		t.Errorf("默认 access_key_env = %q, want DOGECLOUD_ACCESS_KEY", c.ReportImage.AccessKeyEnv)
+	}
+	if c.ReportImage.SecretKeyEnv != "DOGECLOUD_SECRET_KEY" {
+		t.Errorf("默认 secret_key_env = %q, want DOGECLOUD_SECRET_KEY", c.ReportImage.SecretKeyEnv)
+	}
+	if c.ReportImage.PublicBaseURL != "https://img-host.modenc.top" {
+		t.Errorf("默认 public_base_url = %q", c.ReportImage.PublicBaseURL)
+	}
+	if c.ReportImage.KeyPrefix != "e3-reports/" {
+		t.Errorf("默认 key_prefix = %q, want e3-reports/", c.ReportImage.KeyPrefix)
+	}
+	if c.ReportImage.RetentionDays != 90 {
+		t.Errorf("默认 report_image.retention_days = %d, want 90", c.ReportImage.RetentionDays)
+	}
+}
+
+// report_image.enabled 的非法组合逐一被拒（缺 bucket/坏 URL/坏 env 名/
+// retention 越界），报错含字段名；reports.retention_days 越界同样被拒。
+func TestReportImageValidation(t *testing.T) {
+	valid := func() *Config {
+		c := Default()
+		c.ReportImage.Enabled = true
+		c.ReportImage.Bucket = "e3-reports-bucket"
+		return c
+	}
+	cases := []struct {
+		name     string
+		mutate   func(*Config)
+		wantSubs []string
+	}{
+		{"缺 bucket", func(c *Config) { c.ReportImage.Bucket = "" },
+			[]string{"report_image.bucket"}},
+		{"http 非回环 base_url", func(c *Config) { c.ReportImage.PublicBaseURL = "http://img.example.com" },
+			[]string{"report_image.public_base_url", "https"}},
+		{"坏 scheme", func(c *Config) { c.ReportImage.PublicBaseURL = "ftp://img.example.com" },
+			[]string{"report_image.public_base_url", "http(s)"}},
+		{"access_key_env 非法", func(c *Config) { c.ReportImage.AccessKeyEnv = "doge-access-key" },
+			[]string{"report_image.access_key_env"}},
+		{"secret_key_env 非法", func(c *Config) { c.ReportImage.SecretKeyEnv = "" },
+			[]string{"report_image.secret_key_env"}},
+		{"report_image.retention_days 越界", func(c *Config) { c.ReportImage.RetentionDays = 3651 },
+			[]string{"report_image.retention_days", "3650"}},
+		{"reports.retention_days 越界", func(c *Config) { c.Reports.RetentionDays = -1 },
+			[]string{"reports.retention_days"}},
+	}
+	for _, tc := range cases {
+		c := valid()
+		tc.mutate(c)
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("%s: 期望校验报错, 实际通过", tc.name)
+			continue
+		}
+		for _, sub := range tc.wantSubs {
+			if !strings.Contains(err.Error(), sub) {
+				t.Errorf("%s: 报错应包含 %q: %v", tc.name, sub, err)
+			}
+		}
+	}
+
+	// 合法通过例：enabled + 完整配置（含自定义 env 名与 key_prefix）。
+	c := valid()
+	c.ReportImage.AccessKeyEnv = "DOGECLOUD_AK"
+	c.ReportImage.SecretKeyEnv = "DOGECLOUD_SK"
+	c.ReportImage.KeyPrefix = "" // 留空保持默认，不报错
+	c.ReportImage.RetentionDays = 0
+	c.Reports.RetentionDays = 0
+	if err := c.Validate(); err != nil {
+		t.Errorf("合法 report_image 配置不应报错: %v", err)
+	}
+
+	// disabled 时缺 bucket 不校验（默认配置即此形态）。
+	c = Default()
+	c.ReportImage.Bucket = ""
+	if err := c.Validate(); err != nil {
+		t.Errorf("disabled 时不应校验 bucket: %v", err)
+	}
+}
+
+// YAML 键 ntfy.markdown / reports.retention_days / report_image.* 可解码、
+// 覆盖默认值，且未知 report_image 字段仍被严格模式拒绝。
+func TestLoadReportKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+app:
+  timezone: Asia/Shanghai
+  state_dir: /tmp/e3
+cowrie:
+  log_path: /var/log/cowrie/cowrie.json
+database:
+  path: /tmp/e3/events.db
+ntfy:
+  markdown: false
+reports:
+  retention_days: 30
+report_image:
+  enabled: true
+  access_key_env: DOGECLOUD_AK
+  secret_key_env: DOGECLOUD_SK
+  bucket: e3-reports-bucket
+  public_base_url: https://img-host.modenc.top
+  key_prefix: e3-reports/
+  retention_days: 60
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("写临时配置: %v", err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Ntfy.Markdown {
+		t.Error("ntfy.markdown 应覆盖为 false")
+	}
+	if c.Reports.RetentionDays != 30 {
+		t.Errorf("reports.retention_days = %d, want 30", c.Reports.RetentionDays)
+	}
+	if !c.ReportImage.Enabled || c.ReportImage.Bucket != "e3-reports-bucket" ||
+		c.ReportImage.AccessKeyEnv != "DOGECLOUD_AK" || c.ReportImage.SecretKeyEnv != "DOGECLOUD_SK" ||
+		c.ReportImage.RetentionDays != 60 {
+		t.Errorf("report_image 解码结果异常: %+v", c.ReportImage)
+	}
+
+	// 未知字段（KnownFields 严格模式）被拒。
+	bad := filepath.Join(dir, "bad.yaml")
+	badYaml := strings.Replace(yaml, "key_prefix: e3-reports/", "key_prefix: e3-reports/\n  unknown_key: 1", 1)
+	if err := os.WriteFile(bad, []byte(badYaml), 0o600); err != nil {
+		t.Fatalf("写临时配置: %v", err)
+	}
+	if _, err := Load(bad); err == nil || !strings.Contains(err.Error(), "unknown_key") {
+		t.Errorf("未知 report_image 字段应被拒绝, got %v", err)
+	}
+}
+
+// Redacted 含 report_image 的非敏感项（enabled/bucket/env 名），但既有的
+// 脱敏约束不回归（URL userinfo 剥离、无任何解析值）。
+func TestRedactedReportImage(t *testing.T) {
+	c := Default()
+	c.ReportImage.Enabled = true
+	c.ReportImage.Bucket = "e3-reports-bucket"
+	out := c.Redacted()
+	for _, sub := range []string{
+		"report_image=enabled:true", "bucket=e3-reports-bucket",
+		"ak_env=DOGECLOUD_ACCESS_KEY", "sk_env=DOGECLOUD_SECRET_KEY",
+	} {
+		if !strings.Contains(out, sub) {
+			t.Errorf("Redacted 应包含 %q: %s", sub, out)
+		}
+	}
+}

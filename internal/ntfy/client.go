@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -26,6 +27,9 @@ const (
 	MaxBodyBytes = 4096
 	// MaxTitleBytes 是 Title 请求头的字节安全边界，超长按 rune 截断。
 	MaxTitleBytes = 200
+	// maxAttachBytes 是 Attach 附件 URL 的字节上限（ntfy 服务端对
+	// 附件地址的约定边界），超出时本地直接拒绝。
+	maxAttachBytes = 2048
 	// statusPreviewBytes 是 HTTPStatusError.Body 保留的最大字节数。
 	statusPreviewBytes = 500
 	// respReadLimit 限制读取的响应体字节数，防止异常响应占用过多内存。
@@ -79,6 +83,13 @@ type Message struct {
 	Body     string   // 消息正文，非空且不超过 MaxBodyBytes 字节
 	Priority int      // 1..5
 	Tags     []string // 可选标签，以逗号连接
+	// Attach 是外链附件 URL（如报告图表直链）。非空时以 "Attach" 头发送，
+	// 客户端在本地校验其必须为合法 http/https URL 且不超过 2048 字节；
+	// 留空则不携带该头（行为与历史版本一致）。
+	Attach string
+	// Markdown 为 true 时以 "Markdown: yes" 头要求服务端按 Markdown 渲染
+	// 正文（需 ntfy >= 2.11.0）；false 时不发送该头，正文按纯文本处理。
+	Markdown bool
 }
 
 // PublishOutcome 记录一次发布的结果，供发布状态持久化使用。
@@ -90,7 +101,10 @@ type PublishOutcome struct {
 
 // Publish 向 {BaseURL 去尾斜杠}/{Topic} 发送一次 POST。行为约定：
 //
-//   - Topic/Body/Priority 不合法时本地直接返回错误，不发出任何请求；
+//   - Topic/Body/Priority/Attach 不合法时本地直接返回错误，不发出任何请求；
+//   - Markdown=true 时携带 "Markdown: yes" 头，Attach 非空时携带 "Attach"
+//     头（已过本地校验，发送前仍做 headerSafe 清洗）；两者缺席时请求与
+//     历史版本逐字节一致；
 //   - 2xx 视为成功；响应体尝试解析 {"id":"..."}，解析失败不影响成功（ResponseID 为空）；
 //   - 429 与 5xx 返回 HTTPStatusError（IsRetryable=true）；
 //   - 其余非 2xx 返回 HTTPStatusError（IsRetryable=false），Body 截断至 500 字节；
@@ -114,6 +128,12 @@ func (c *Client) Publish(ctx context.Context, m Message) (PublishOutcome, error)
 	}
 	if tags := joinTags(m.Tags); tags != "" {
 		req.Header.Set("Tags", tags)
+	}
+	if m.Markdown {
+		req.Header.Set("Markdown", "yes")
+	}
+	if m.Attach != "" {
+		req.Header.Set("Attach", headerSafe(m.Attach, maxAttachBytes))
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
@@ -174,7 +194,7 @@ func (e *HTTPStatusError) Is(target error) bool {
 // ValidationError 表示消息未通过本地校验（或 BaseURL 未配置），
 // 未发出任何网络请求。不可重试。
 type ValidationError struct {
-	Field  string // topic|body|priority|base_url
+	Field  string // topic|body|priority|attach|base_url
 	Reason string
 }
 
@@ -218,7 +238,27 @@ func validateMessage(m Message) error {
 	if m.Priority < 1 || m.Priority > 5 {
 		return &ValidationError{Field: "priority", Reason: fmt.Sprintf("must be within 1-5, got %d", m.Priority)}
 	}
+	if m.Attach != "" {
+		if len(m.Attach) > maxAttachBytes {
+			return &ValidationError{Field: "attach", Reason: fmt.Sprintf(
+				"length %d bytes exceeds limit %d", len(m.Attach), maxAttachBytes)}
+		}
+		u, err := url.Parse(m.Attach)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return &ValidationError{Field: "attach", Reason: fmt.Sprintf(
+				"must be a valid http(s) URL, got %q", clipForReason(m.Attach, 120))}
+		}
+	}
 	return nil
+}
+
+// clipForReason 把过长的值截断到不超过 max 字节（回退 UTF-8 边界），
+// 避免校验错误信息被超长附件地址撑爆。
+func clipForReason(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return previewBytes([]byte(s), max) + "…"
 }
 
 // joinTags 过滤空标签与控制字符后以逗号连接；结果为空表示不发送 Tags 头。
