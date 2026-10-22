@@ -77,9 +77,10 @@ llm:
   # 发起一次不带 tools 的最终补全强制收稿（未详细分析部分写入
   # data_limitations），仅当该调用失败才任务失败。
   hard_tool_rounds: 24
-  # 单次响应最大输出 Token。范围 [256, 131072]。思考模型的推理 Token
+  # 单次响应最大输出 Token。范围 [256, 131072]，默认 65536（DS 最新上下文
+  # 窗口 1M，单轮 64k 足够；需更大可按需上调）。思考模型的推理 Token
   # 计入输出预算，思考模型建议保持大值以免思考打满预算导致输出截断。
-  max_output_tokens: 131072
+  max_output_tokens: 65536
   # 任务级累计 Token 预算。范围 [10000, 10000000]。
   max_total_tokens: 200000
   # 是否启用工具调用；false 时降级为一次性结构化分析（无 execute_js 等）。

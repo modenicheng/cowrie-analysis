@@ -134,7 +134,7 @@ func Default() *Config {
 	c.LLM.TimeoutSeconds = 90
 	c.LLM.MaxToolRounds = 8
 	c.LLM.HardToolRounds = 24
-	c.LLM.MaxOutputTokens = 131072
+	c.LLM.MaxOutputTokens = 65536
 	c.LLM.MaxTotalTokens = 200000
 	c.LLM.EnableTools = true
 	c.LLM.Thinking = "auto"

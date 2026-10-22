@@ -19,8 +19,8 @@ func TestLLMDefaults(t *testing.T) {
 	if c.LLM.HardToolRounds != 24 {
 		t.Errorf("默认 hard_tool_rounds = %d, want 24", c.LLM.HardToolRounds)
 	}
-	if c.LLM.MaxOutputTokens != 131072 {
-		t.Errorf("默认 max_output_tokens = %d, want 131072", c.LLM.MaxOutputTokens)
+	if c.LLM.MaxOutputTokens != 65536 {
+		t.Errorf("默认 max_output_tokens = %d, want 65536（单轮 64k 足够，128k 仍可配置）", c.LLM.MaxOutputTokens)
 	}
 	if c.LLM.Thinking != "auto" {
 		t.Errorf("默认 thinking = %q, want auto", c.LLM.Thinking)

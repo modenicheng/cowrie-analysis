@@ -154,7 +154,7 @@ sqlite3 /tmp/e3smoke/events.db "SELECT file_key, offset, file_size FROM collecto
 | `llm.timeout_seconds` | `90` | 单次 HTTP 总超时，范围 [5, 600] |
 | `llm.max_tool_rounds` | `8` | 工具调用轮数**软上限**，范围 [1, 64]：超出后每个后续轮次向模型注入「尽快收尾并 submit_report」提示，但不阻断工具调用 |
 | `llm.hard_tool_rounds` | `24` | 工具调用轮数**硬上限**，范围 [1, 64] 且必须 ≥ `max_tool_rounds`：到达后发起一次不带 tools 的最终补全强制收稿（未详细分析部分写入 data_limitations），仅当该最终调用失败才任务失败 |
-| `llm.max_output_tokens` | `131072` | 单次响应输出 Token 上限，范围 [256, 131072]；思考模型推理 Token 计入输出预算，配小值会被思考打满导致输出截断 |
+| `llm.max_output_tokens` | `65536` | 单次响应输出 Token 上限（单轮补全语义），范围 [256, 131072]，需要更大输出可按需上调；思考模型推理 Token 计入输出预算，配小值会被思考打满导致输出截断 |
 | `llm.max_total_tokens` | `200000` | 任务级累计 Token 预算，范围 [10000, 10000000] |
 | `llm.enable_tools` | `true` | false 时降级为一次性结构化分析（json_object 模式，无工具） |
 | `llm.include_passwords` | `false` | **安全注意**：是否把登录尝试的 password 字段提交给模型。源 IP/用户名/命令/路径始终保留原值，仅凭据字段受此开关控制 |
