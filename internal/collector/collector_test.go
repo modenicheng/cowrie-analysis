@@ -343,9 +343,10 @@ func TestMissingFile(t *testing.T) {
 		t.Fatalf("同一缺失期间 gap 数应不变: %d → %d", len(gaps), len(gaps2))
 	}
 
-	// 重建文件后恢复采集
+	// 重建文件后恢复采集。窗口放宽：文件重建走轮转切换路径，需等
+	// rotationGrace 到期，CI 慢机上 2s 不够（实测 2.11s 仍差一步）。
 	os.WriteFile(logPath, []byte(line(9)+"\n"), 0o644)
-	pollUntil(t, c, db, 2, 2*time.Second)
+	pollUntil(t, c, db, 2, 10*time.Second)
 }
 
 // —— 8. DB 写失败：db.Close() 后 PollOnce 必须返回 error（不静默）——
