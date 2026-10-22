@@ -24,8 +24,12 @@ var (
 	// and empty or oversized final model content.
 	ErrInvalidResponse = errors.New("llm: invalid response from model")
 
-	// ErrToolRoundsExceeded is returned when the model still requests tools
-	// after MaxToolRounds tool rounds have already been executed.
+	// ErrToolRoundsExceeded is returned only when the model still requests
+	// tools after the hard round limit (HardToolRounds) AND the forced
+	// toolless final completion itself fails (HTTP/timeout). Reaching the
+	// hard limit alone never fails: the final call's output is returned
+	// through the normal content path instead. Exceeding the soft limit
+	// (MaxToolRounds) only injects per-round wrap-up hints.
 	ErrToolRoundsExceeded = errors.New("llm: maximum tool call rounds exceeded")
 
 	// ErrTokenBudgetExceeded is returned when accumulated prompt+completion

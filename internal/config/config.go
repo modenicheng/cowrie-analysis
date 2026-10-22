@@ -41,14 +41,21 @@ type Config struct {
 	} `yaml:"database"`
 
 	LLM struct {
-		BaseURL         string `yaml:"base_url"`
-		Model           string `yaml:"model"`
-		APIKeyEnv       string `yaml:"api_key_env"`
-		TimeoutSeconds  int    `yaml:"timeout_seconds"`
-		MaxToolRounds   int    `yaml:"max_tool_rounds"`
+		BaseURL        string `yaml:"base_url"`
+		Model          string `yaml:"model"`
+		APIKeyEnv      string `yaml:"api_key_env"`
+		TimeoutSeconds int    `yaml:"timeout_seconds"`
+		// MaxToolRounds 是工具调用轮数软上限：超出后每个后续轮次向模型
+		// 注入收尾提示（尽快 submit_report），但不阻断工具调用。
+		MaxToolRounds int `yaml:"max_tool_rounds"`
+		// HardToolRounds 是工具调用轮数硬上限：到达后由 LLM 客户端发起
+		// 一次不带 tools 的最终补全强制收稿。必须 >= MaxToolRounds。
+		HardToolRounds  int    `yaml:"hard_tool_rounds"`
 		MaxOutputTokens int    `yaml:"max_output_tokens"`
 		MaxTotalTokens  int    `yaml:"max_total_tokens"`
 		EnableTools     bool   `yaml:"enable_tools"`
+		Thinking        string `yaml:"thinking"`         // auto|on|off，auto=不干预
+		ReasoningEffort string `yaml:"reasoning_effort"` // ""|low|medium|high|max，""=不干预
 		// IncludePasswords 控制是否把登录尝试中的 password 字段提交给模型（§9）。
 		IncludePasswords bool `yaml:"include_passwords"`
 	} `yaml:"llm"`
@@ -119,10 +126,13 @@ func Default() *Config {
 	c.LLM.Model = "deepseek-chat"
 	c.LLM.APIKeyEnv = "DEEPSEEK_API_KEY"
 	c.LLM.TimeoutSeconds = 90
-	c.LLM.MaxToolRounds = 6
-	c.LLM.MaxOutputTokens = 4096
+	c.LLM.MaxToolRounds = 8
+	c.LLM.HardToolRounds = 24
+	c.LLM.MaxOutputTokens = 131072
 	c.LLM.MaxTotalTokens = 200000
 	c.LLM.EnableTools = true
+	c.LLM.Thinking = "auto"
+	c.LLM.ReasoningEffort = ""
 	c.LLM.IncludePasswords = false
 
 	c.ScriptRunner.Enabled = true
@@ -251,14 +261,33 @@ func (c *Config) Validate() error {
 	if err := inRange(c.LLM.TimeoutSeconds, 5, 600, "llm.timeout_seconds"); err != nil {
 		return err
 	}
-	if err := inRange(c.LLM.MaxToolRounds, 1, 16, "llm.max_tool_rounds"); err != nil {
+	if err := inRange(c.LLM.MaxToolRounds, 1, 64, "llm.max_tool_rounds"); err != nil {
 		return err
 	}
-	if err := inRange(c.LLM.MaxOutputTokens, 256, 32768, "llm.max_output_tokens"); err != nil {
+	if err := inRange(c.LLM.HardToolRounds, 1, 64, "llm.hard_tool_rounds"); err != nil {
+		return err
+	}
+	if c.LLM.HardToolRounds < c.LLM.MaxToolRounds {
+		return fmt.Errorf("llm.hard_tool_rounds=%d 必须 >= llm.max_tool_rounds=%d（硬上限不能低于软上限）",
+			c.LLM.HardToolRounds, c.LLM.MaxToolRounds)
+	}
+	if err := inRange(c.LLM.MaxOutputTokens, 256, 131072, "llm.max_output_tokens"); err != nil {
 		return err
 	}
 	if err := inRange(c.LLM.MaxTotalTokens, 10000, 10000000, "llm.max_total_tokens"); err != nil {
 		return err
+	}
+	switch c.LLM.Thinking {
+	case "auto", "on", "off":
+	default:
+		return fmt.Errorf("llm.thinking=%q 不合法，允许值：auto（默认，不发送该字段）|on（thinking.type=enabled）|off（thinking.type=disabled）",
+			c.LLM.Thinking)
+	}
+	switch c.LLM.ReasoningEffort {
+	case "", "low", "medium", "high", "max":
+	default:
+		return fmt.Errorf("llm.reasoning_effort=%q 不合法，允许值：留空（默认，不发送该字段）|low|medium|high|max",
+			c.LLM.ReasoningEffort)
 	}
 
 	if c.ScriptRunner.Enabled {

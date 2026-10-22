@@ -144,12 +144,15 @@ sqlite3 /tmp/e3smoke/events.db "SELECT file_key, offset, file_size FROM collecto
 
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
-| `llm.base_url` | `https://api.deepseek.com` | OpenAI 兼容 Base URL，**必须 https**（仅回环地址允许 http） |
+| `llm.base_url` | `https://api.deepseek.com` | OpenAI 兼容 Base URL，**必须 https**（仅回环地址允许 http）；日志打印前剥离 URL userinfo |
 | `llm.model` | `deepseek-chat` | 模型名 |
+| `llm.thinking` | `auto` | 思考模式开关，允许 `auto`（默认，不发送该字段，服务端默认=思考模型开启思考）\|`on`（`thinking.type=enabled`）\|`off`（`thinking.type=disabled`） |
+| `llm.reasoning_effort` | `""` | 思考强度（DeepSeek `reasoning_effort`），允许 留空（默认，不发送该字段，服务端默认 high）\|`low`\|`medium`（服务端映射 high）\|`high`\|`max`；思考模型建议同时配大 `max_output_tokens` |
 | `llm.api_key_env` | `DEEPSEEK_API_KEY` | **安全注意**：API Key 所在环境变量名，值经 0600 的 llm.env 注入；配置文件/日志/报告中绝不出现 Key 本体 |
 | `llm.timeout_seconds` | `90` | 单次 HTTP 总超时，范围 [5, 600] |
-| `llm.max_tool_rounds` | `6` | 单任务最大工具调用轮数，范围 [1, 16]，超出返回明确失败 |
-| `llm.max_output_tokens` | `4096` | 单次响应输出 Token 上限，范围 [256, 32768] |
+| `llm.max_tool_rounds` | `8` | 工具调用轮数**软上限**，范围 [1, 64]：超出后每个后续轮次向模型注入「尽快收尾并 submit_report」提示，但不阻断工具调用 |
+| `llm.hard_tool_rounds` | `24` | 工具调用轮数**硬上限**，范围 [1, 64] 且必须 ≥ `max_tool_rounds`：到达后发起一次不带 tools 的最终补全强制收稿（未详细分析部分写入 data_limitations），仅当该最终调用失败才任务失败 |
+| `llm.max_output_tokens` | `131072` | 单次响应输出 Token 上限，范围 [256, 131072]；思考模型推理 Token 计入输出预算，配小值会被思考打满导致输出截断 |
 | `llm.max_total_tokens` | `200000` | 任务级累计 Token 预算，范围 [10000, 10000000] |
 | `llm.enable_tools` | `true` | false 时降级为一次性结构化分析（json_object 模式，无工具） |
 | `llm.include_passwords` | `false` | **安全注意**：是否把登录尝试的 password 字段提交给模型。源 IP/用户名/命令/路径始终保留原值，仅凭据字段受此开关控制 |

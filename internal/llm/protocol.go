@@ -35,24 +35,41 @@ type toolCallMsg struct {
 	Function functionCall `json:"function"`
 }
 
-// message is one entry of the request/response "messages" array, supporting
-// the system, user, assistant and tool roles.
-type message struct {
-	Role       string        `json:"role"`                   // system|user|assistant|tool
-	Content    string        `json:"content"`                // tool results and text content
-	ToolCalls  []toolCallMsg `json:"tool_calls,omitempty"`   // assistant only
-	ToolCallID string        `json:"tool_call_id,omitempty"` // tool role only
+// thinkingParam is the DeepSeek thinking-mode switch: {"type":"enabled"} or
+// {"type":"disabled"}. Omitting the whole field leaves the provider default
+// (thinking on, effort high for thinking models).
+type thinkingParam struct {
+	Type string `json:"type"` // "enabled" | "disabled"
 }
 
-// chatRequest is the POST /chat/completions body.
+// message is one entry of the request/response "messages" array, supporting
+// the system, user, assistant and tool roles. ReasoningContent carries the
+// DeepSeek reasoning_content field (sibling of content): it appears on
+// assistant responses from thinking models and MUST be echoed back verbatim
+// with that assistant message in later requests when the request carries
+// tools (DeepSeek rejects the conversation with 400 otherwise). omitempty
+// keeps non-thinking models' wire format unchanged.
+type message struct {
+	Role             string        `json:"role"`                        // system|user|assistant|tool
+	Content          string        `json:"content"`                     // tool results and text content
+	ReasoningContent string        `json:"reasoning_content,omitempty"` // assistant only, thinking models
+	ToolCalls        []toolCallMsg `json:"tool_calls,omitempty"`        // assistant only
+	ToolCallID       string        `json:"tool_call_id,omitempty"`      // tool role only
+}
+
+// chatRequest is the POST /chat/completions body. Thinking and
+// ReasoningEffort control DeepSeek thinking mode and effort; both omitted =
+// provider default (do not interfere).
 type chatRequest struct {
-	Model          string           `json:"model"`
-	Messages       []message        `json:"messages"`
-	MaxTokens      int              `json:"max_tokens,omitempty"`
-	Stream         bool             `json:"stream"` // always false
-	Tools          []toolDefinition `json:"tools,omitempty"`
-	ToolChoice     any              `json:"tool_choice,omitempty"` // "auto" when tools present
-	ResponseFormat *responseFormat  `json:"response_format,omitempty"`
+	Model           string           `json:"model"`
+	Messages        []message        `json:"messages"`
+	MaxTokens       int              `json:"max_tokens,omitempty"`
+	Stream          bool             `json:"stream"` // always false
+	Tools           []toolDefinition `json:"tools,omitempty"`
+	ToolChoice      any              `json:"tool_choice,omitempty"` // "auto" when tools present
+	ResponseFormat  *responseFormat  `json:"response_format,omitempty"`
+	Thinking        *thinkingParam   `json:"thinking,omitempty"`         // DeepSeek thinking switch
+	ReasoningEffort string           `json:"reasoning_effort,omitempty"` // low|medium|high|max
 }
 
 // usageInfo is the token accounting block of a response.

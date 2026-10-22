@@ -52,15 +52,27 @@ llm:
   base_url: https://api.deepseek.com
   # 模型名。
   model: deepseek-chat
+  # 思考模式开关：auto=不发送该字段（服务端默认：思考模型开启思考）；
+  # on=thinking.type=enabled；off=thinking.type=disabled。允许值 auto|on|off。
+  thinking: auto
+  # 思考强度（DeepSeek reasoning_effort）：留空=不发送该字段（默认 high）；
+  # medium 由服务端映射为 high。允许值 留空|low|medium|high|max。
+  reasoning_effort: ""
   # API Key 所在环境变量名（值经 /etc/e3-security-analyst/llm.env 注入，
   # 0600 e3sec:e3sec；本文件不写 Key 本体）。
   api_key_env: DEEPSEEK_API_KEY
   # 单次 HTTP 请求总超时（秒）。范围 [5, 600]。
   timeout_seconds: 90
-  # 单任务最大工具调用轮数。范围 [1, 16]；达到上限返回部分分析或明确失败。
-  max_tool_rounds: 6
-  # 单次响应最大输出 Token。范围 [256, 32768]。
-  max_output_tokens: 4096
+  # 工具调用轮数软上限。范围 [1, 64]；超出后每个后续轮次向模型注入
+  # 收尾提示（尽快 submit_report），但不阻断工具调用。
+  max_tool_rounds: 8
+  # 工具调用轮数硬上限。范围 [1, 64]，必须 >= max_tool_rounds；到达后
+  # 发起一次不带 tools 的最终补全强制收稿（未详细分析部分写入
+  # data_limitations），仅当该调用失败才任务失败。
+  hard_tool_rounds: 24
+  # 单次响应最大输出 Token。范围 [256, 131072]。思考模型的推理 Token
+  # 计入输出预算，思考模型建议保持大值以免思考打满预算导致输出截断。
+  max_output_tokens: 131072
   # 任务级累计 Token 预算。范围 [10000, 10000000]。
   max_total_tokens: 200000
   # 是否启用工具调用；false 时降级为一次性结构化分析（无 execute_js 等）。

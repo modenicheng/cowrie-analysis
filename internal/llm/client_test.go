@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -499,21 +500,151 @@ func TestToolFailuresFeedErrorBack(t *testing.T) {
 	}
 }
 
-// 9. Model never stops requesting tools -> ErrToolRoundsExceeded.
-func TestToolRoundsExceeded(t *testing.T) {
-	var n atomic.Int32
+// 9. 软/硬两档轮数控制：超出软上限后每个后续轮次注入收尾提示且工具仍
+// 可用；到达硬上限触发一次不带 tools 的最终补全，任务以可解析结果结束
+// 而非错误。
+func TestSoftHardToolRoundLimits(t *testing.T) {
+	var mu sync.Mutex
+	var reqs []chatRequest
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := fmt.Sprintf("call_%d", n.Add(1))
-		writeChat(t, w, toolCallResp(id, "query_stats", `{}`, 1, 1))
+		body, _ := io.ReadAll(r.Body)
+		var req chatRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		reqs = append(reqs, req)
+		n := len(reqs)
+		mu.Unlock()
+		// 带工具的请求一律继续要工具（模型固执到硬上限）；不带工具的
+		// 最终补全返回可被 generator 兜底解析的报告 JSON。
+		if len(req.Tools) > 0 {
+			writeChat(t, w, toolCallResp(fmt.Sprintf("call_%d", n), "query_stats", `{}`, 1, 1))
+			return
+		}
+		writeChat(t, w, finalResp(`{"type":"daily","summary":"degraded final"}`, "stop", 9, 9))
 	}))
 	defer srv.Close()
 
 	c := testClient(srv.URL, func(cfg *ClientConfig) {
 		cfg.EnableTools = true
-		cfg.MaxToolRounds = 2
+		cfg.MaxToolRounds = 2  // 软上限
+		cfg.HardToolRounds = 4 // 硬上限
+	})
+	res, err := c.Run(context.Background(), RunRequest{
+		UserPrompt: "go",
+		Tools: map[string]ToolSpec{
+			"query_stats": {Name: "query_stats", Description: "stats"},
+		},
+		Handlers: map[string]ToolHandler{
+			"query_stats": func(ctx context.Context, call ToolCall) (string, error) {
+				return "{}", nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run（硬限强制收稿应成功而非报错）: %v", err)
+	}
+	if string(res.Content) != `{"type":"daily","summary":"degraded final"}` {
+		t.Errorf("Content = %q, want 强制收稿的最终报告 JSON", res.Content)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reqs) != 6 { // 4 个带工具轮 + 1 个触发硬限的请求 + 1 次最终补全
+		t.Fatalf("server saw %d requests, want 6", len(reqs))
+	}
+	if res.ToolCalls != 4 || res.Rounds != 6 {
+		t.Errorf("ToolCalls=%d Rounds=%d, want 4/6", res.ToolCalls, res.Rounds)
+	}
+
+	// 软上限提示计数：请求 1-2（轮 1-2，未超软限）无提示；
+	// 轮 3 起每执行一轮追加一条，出现在其后每个请求里。
+	countHints := func(i int) int {
+		n := 0
+		for _, m := range reqs[i].Messages {
+			if m.Role == "system" && strings.Contains(m.Content, "软上限") {
+				n++
+			}
+		}
+		return n
+	}
+	for i, want := range []int{0, 0, 0, 1, 2, 2} {
+		if got := countHints(i); got != want {
+			t.Errorf("request %d: soft-limit hints = %d, want %d", i+1, got, want)
+		}
+	}
+	// 软限后工具仍可用：触发硬限的请求（第 5 个）依旧带 tools。
+	if len(reqs[4].Tools) == 0 {
+		t.Errorf("request 5 (beyond soft limit) must still advertise tools")
+	}
+	// 提示内容必须包含 data_limitations 引导。
+	if !strings.Contains(reqs[4].Messages[len(reqs[4].Messages)-1].Content, "data_limitations") {
+		t.Errorf("soft-limit hint should mention data_limitations")
+	}
+
+	// 最终补全：不带 tools/tool_choice，保留全部对话历史，末尾追加硬限收稿指令。
+	finalReq := reqs[5]
+	if len(finalReq.Tools) != 0 {
+		t.Errorf("final completion must not carry tools, got %d", len(finalReq.Tools))
+	}
+	if tc, _ := finalReq.ToolChoice.(string); tc != "" {
+		t.Errorf("final completion must not carry tool_choice, got %q", tc)
+	}
+	// 历史：user + 4×(assistant+tool) + 2 条软限提示 + 1 条硬限指令 = 12。
+	if len(finalReq.Messages) != 12 {
+		t.Fatalf("final completion has %d messages, want 12: %+v", len(finalReq.Messages), finalReq.Messages)
+	}
+	last := finalReq.Messages[len(finalReq.Messages)-1]
+	if last.Role != "system" || !strings.Contains(last.Content, "硬上限") {
+		t.Errorf("last message of final completion = %+v, want hard-limit system instruction", last)
+	}
+	// 历史里的 assistant 工具轮完整保留（4 条 tool_calls）。
+	asst := 0
+	for _, m := range finalReq.Messages {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			asst++
+		}
+	}
+	if asst != 4 {
+		t.Errorf("final completion preserved %d assistant tool rounds, want 4", asst)
+	}
+}
+
+// 9b. 硬限收稿的最终调用本身失败（HTTP 500 重试耗尽）→ 错误同时匹配
+// ErrToolRoundsExceeded 与 *HTTPStatusError。
+func TestHardLimitFinalCallFails(t *testing.T) {
+	var mu sync.Mutex
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req chatRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		n++
+		mu.Unlock()
+		if len(req.Tools) > 0 {
+			writeChat(t, w, toolCallResp(fmt.Sprintf("call_%d", n), "query_stats", `{}`, 1, 1))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "final call boom")
+	}))
+	defer srv.Close()
+
+	c := testClient(srv.URL, func(cfg *ClientConfig) {
+		cfg.EnableTools = true
+		cfg.MaxToolRounds = 1
+		cfg.HardToolRounds = 1
 	})
 	_, err := c.Run(context.Background(), RunRequest{
 		UserPrompt: "go",
+		Tools: map[string]ToolSpec{
+			"query_stats": {Name: "query_stats", Description: "stats"},
+		},
 		Handlers: map[string]ToolHandler{
 			"query_stats": func(ctx context.Context, call ToolCall) (string, error) {
 				return "{}", nil
@@ -523,9 +654,138 @@ func TestToolRoundsExceeded(t *testing.T) {
 	if !errors.Is(err, ErrToolRoundsExceeded) {
 		t.Fatalf("err = %v, want ErrToolRoundsExceeded", err)
 	}
-	// Two executed tool rounds plus the request that asked for a third.
-	if got := n.Load(); got != 3 {
-		t.Errorf("server saw %d requests, want 3", got)
+	var se *HTTPStatusError
+	if !errors.As(err, &se) || se.Code != http.StatusInternalServerError {
+		t.Errorf("err = %v, want wrapped *HTTPStatusError{500}", err)
+	}
+	// 1 个工具轮 + 1 个触发硬限的请求 + 最终补全的初始尝试与 3 次重试。
+	mu.Lock()
+	defer mu.Unlock()
+	if n != 2+maxRetries+1 {
+		t.Errorf("server saw %d requests, want %d", n, 2+maxRetries+1)
+	}
+}
+
+// 9c. reasoning_content 往返透传：assistant 工具轮返回的思考内容必须在
+// 后续请求中随该 assistant 消息原样带回（DeepSeek 带 tools 的 400 规则）；
+// 模型不返回该字段时请求不得出现该键。
+func TestReasoningContentRoundTrip(t *testing.T) {
+	const chain = "let me check the stats for this window..."
+	for _, withReasoning := range []bool{true, false} {
+		var n atomic.Int32
+		var secondBody string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			if n.Add(1) == 1 {
+				msg := message{
+					Role: "assistant",
+					ToolCalls: []toolCallMsg{{ID: "call_r", Type: "function",
+						Function: functionCall{Name: "query_stats", Arguments: `{}`}}},
+				}
+				if withReasoning {
+					msg.ReasoningContent = chain
+				}
+				writeChat(t, w, chatResponse{
+					Choices: []choice{{Message: msg, FinishReason: "tool_calls"}},
+					Usage:   usageInfo{PromptTokens: 1, CompletionTokens: 1},
+				})
+				return
+			}
+			secondBody = string(body)
+			writeChat(t, w, finalResp(`{"done":true}`, "stop", 2, 2))
+		}))
+
+		c := testClient(srv.URL, func(cfg *ClientConfig) { cfg.EnableTools = true })
+		_, err := c.Run(context.Background(), RunRequest{
+			UserPrompt: "go",
+			Handlers: map[string]ToolHandler{
+				"query_stats": func(ctx context.Context, call ToolCall) (string, error) {
+					return "{}", nil
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("withReasoning=%v: Run: %v", withReasoning, err)
+		}
+
+		var secondReq chatRequest
+		if err := json.Unmarshal([]byte(secondBody), &secondReq); err != nil {
+			t.Fatalf("decode second request: %v", err)
+		}
+		if len(secondReq.Messages) != 3 {
+			t.Fatalf("second request has %d messages, want 3", len(secondReq.Messages))
+		}
+		asst := secondReq.Messages[1]
+		if withReasoning {
+			if asst.ReasoningContent != chain {
+				t.Errorf("assistant message reasoning_content = %q, want %q (echoed verbatim)",
+					asst.ReasoningContent, chain)
+			}
+			if !strings.Contains(secondBody, `"reasoning_content"`) {
+				t.Errorf("second request body must carry reasoning_content key")
+			}
+		} else if strings.Contains(secondBody, `"reasoning_content"`) {
+			t.Errorf("non-thinking model: second request must NOT contain reasoning_content, got %s", secondBody)
+		}
+	}
+}
+
+// 9d. thinking / reasoning_effort 注入：默认与 auto 不发送两个键；on/off
+// 分别映射 thinking.type=enabled/disabled；effort 原样透传。
+func TestThinkingAndReasoningEffortParams(t *testing.T) {
+	cases := []struct {
+		name         string
+		mutate       func(*ClientConfig)
+		wantThinking string // "" = 键必须缺失
+		wantEffort   string // "" = 键必须缺失
+	}{
+		{"default omits both", nil, "", ""},
+		{"auto omits both", func(c *ClientConfig) { c.Thinking = "auto" }, "", ""},
+		{"on+low", func(c *ClientConfig) { c.Thinking = "on"; c.ReasoningEffort = "low" },
+			`"enabled"`, `"low"`},
+		{"off+max", func(c *ClientConfig) { c.Thinking = "off"; c.ReasoningEffort = "max" },
+			`"disabled"`, `"max"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw map[string]json.RawMessage
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if err := json.Unmarshal(body, &raw); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				writeChat(t, w, finalResp(`{"ok":true}`, "stop", 1, 1))
+			}))
+			defer srv.Close()
+
+			c := testClient(srv.URL, tc.mutate)
+			if _, err := c.Run(context.Background(), RunRequest{UserPrompt: "hi"}); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			checkKey := func(key, want string) {
+				got, ok := raw[key]
+				if want == "" {
+					if ok {
+						t.Errorf("%s must be absent, got %s", key, got)
+					}
+					return
+				}
+				if !ok || string(got) != want {
+					t.Errorf("%s = %s (present=%v), want %s", key, got, ok, want)
+				}
+			}
+			// thinking 形如 {"type":"enabled"}；reasoning_effort 形如 "low"。
+			var wantThinkRaw string
+			if tc.wantThinking != "" {
+				wantThinkRaw = `{"type":` + tc.wantThinking + `}`
+			}
+			var wantEffortRaw string
+			if tc.wantEffort != "" {
+				wantEffortRaw = tc.wantEffort
+			}
+			checkKey("thinking", wantThinkRaw)
+			checkKey("reasoning_effort", wantEffortRaw)
+		})
 	}
 }
 
